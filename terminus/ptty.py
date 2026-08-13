@@ -137,6 +137,127 @@ class SemanticMark(object):
             self.kind, "" if self.exit_code is None else ", " + str(self.exit_code))
 
 
+# the only schemes a terminal has any business handing to the OS, everything else
+# an OSC 8 sequence may name is refused rather than repaired
+LINK_SCHEMES = ("http", "https", "file")
+# a target longer than this is not a link anybody is meant to click, and a hostile
+# sequence must not be able to grow the state of the screen without bound
+MAX_LINK_URI_LENGTH = 2048
+# the id= of a link only ties two runs of text together, a long one buys nothing
+MAX_LINK_ID_LENGTH = 64
+# a shell which opens a link and never closes it must not swallow the rest of the
+# session, the link is dropped once it covered this many cells. that is several
+# screens worth of text and far more than any label, so a link which really is
+# that long is a broken emitter and not something worth keeping
+MAX_LINK_CELLS = 8192
+# how many distinct targets are kept around so that equal ones share one object. a
+# build log with more links than this starts the sharing over instead of
+# remembering every url it ever printed
+MAX_LINK_CACHE = 256
+# a control character, a raw space or a c1 byte inside a uri, a well formed one
+# percent encodes every one of them
+UNSAFE_IN_URI = re.compile(r"[\x00-\x20\x7f-\x9f]")
+# the shared empty result of line_links, it is never mutated
+EMPTY_LINKS = ()
+
+
+def safe_link_uri(uri):
+    """
+    Check the target of an OSC 8 hyperlink and return the uri to store, or None
+    when it must not be stored at all. Everything reaching this came out of the
+    pty, so it may be a hostile filename, a log line or a git branch name, and the
+    only answer to a scheme we do not know is to refuse the whole link.
+    """
+    if not uri:
+        return None
+    uri = uri.strip()
+    if not uri or len(uri) > MAX_LINK_URI_LENGTH:
+        return None
+    if UNSAFE_IN_URI.search(uri):
+        return None
+    scheme, sep, _ = uri.partition(":")
+    if not sep:
+        # a relative reference names nothing we could ever open on our own
+        return None
+    # the scheme is what stands in front of the first colon and nothing else. a "%"
+    # in there could be decoded into a different scheme further on, e.g.
+    # "%6aavascript:", and a "/", "?" or "#" means the colon belongs to the path
+    # and the reference has no scheme at all
+    if any(c in scheme for c in ("%", "/", "?", "#")):
+        return None
+    if scheme.lower() not in LINK_SCHEMES:
+        return None
+    return uri
+
+
+def line_links(buffer_line):
+    """
+    the OSC 8 hyperlink spans a buffer line carries, this is the one place the
+    attribute is read. the result is a tuple of HyperlinkSpan ordered by column and
+    must be treated as immutable, a line in the scrollback may be sharing it with
+    the line it was copied from
+    """
+    return getattr(buffer_line, "hyperlinks", EMPTY_LINKS)
+
+
+def link_at(buffer_line, column):
+    """
+    the Hyperlink covering a column of a buffer line, or None
+    """
+    for span in line_links(buffer_line):
+        if span.start <= column < span.end:
+            return span.link
+    return None
+
+
+class Hyperlink(object):
+    """
+    the target of an OSC 8 hyperlink. one instance is shared by every span pointing
+    at it, so a build log full of links keeps the url once and a reference per run
+    of text. link_id is the id= of the sequence, it is "" when the shell did not
+    send one, and two spans of the same non empty id are one logical link even when
+    a wrap or an unrelated line sits between them
+    """
+    __slots__ = ("uri", "link_id")
+
+    def __init__(self, uri, link_id=""):
+        self.uri = uri
+        self.link_id = link_id
+
+    def __repr__(self):
+        return "Hyperlink({}{})".format(
+            self.uri, "" if not self.link_id else ", id=" + self.link_id)
+
+
+class HyperlinkSpan(object):
+    """
+    a run of cells of one buffer line which is inside a hyperlink. start is
+    inclusive, end is exclusive and both are buffer columns, the same columns
+    segment_buffer_line reports. spans belong to terminal content and not to a view
+    row, render.py turns them into a row when it writes that line out.
+
+    a span is never modified once it is built, a line copied into the scrollback
+    shares its spans with the line it came from
+    """
+    __slots__ = ("start", "end", "link")
+
+    def __init__(self, start, end, link):
+        self.start = start
+        self.end = end
+        self.link = link
+
+    @property
+    def uri(self):
+        return self.link.uri
+
+    @property
+    def link_id(self):
+        return self.link.link_id
+
+    def __repr__(self):
+        return "HyperlinkSpan({}, {}, {})".format(self.start, self.end, self.link)
+
+
 FILE_PARAM_PATTERN = re.compile(
     r"^File=(?P<arguments>[^:]*?):(?P<data>[a-zA-Z0-9\+/=]*)(?P<cr>\r?)$"
 )
@@ -231,6 +352,20 @@ class TerminalScreen(pyte.Screen):
         # shell's own view of it and may name a path which does not exist on this
         # side of the pty, a wsl shell reports wsl paths
         self.cwd = None
+        # the OSC 8 hyperlink which is open, every cell drawn from now on is inside
+        # it, and the number of cells it covered so far. these have to exist before
+        # super().__init__() because it calls reset()
+        self._link = None
+        self._link_cells = 0
+        # whether a link was ever put on a line of this screen. draw() consults it
+        # to keep the terminal of somebody whose shell emits no OSC 8 at all exactly
+        # as fast as it was, and it is only ever cleared by reset() because leaving
+        # it set costs a lookup and clearing it too eagerly would lose a span
+        self._link_seen = False
+        # the targets seen so far, so that equal ones share one Hyperlink instead of
+        # one copy of the url per run of text. sys.intern is deliberately not used,
+        # interned strings are never freed and the urls come from the pty
+        self._link_cache = {}
         super().__init__(*args, **kwargs)
 
     # @property
@@ -254,6 +389,11 @@ class TerminalScreen(pyte.Screen):
         super().reset()
         self.cursor = Cursor(0, 0)
         self.history.clear()
+        # nothing of the old session is on the screen any more, an open link would
+        # otherwise keep swallowing whatever the fresh one draws
+        self.close_hyperlink()
+        self._link_cache = {}
+        self._link_seen = False
         self._reset_callback()
 
     def clamp_cursor(self):
@@ -290,6 +430,8 @@ class TerminalScreen(pyte.Screen):
             for line in self.buffer.values():
                 for x in range(columns, self.columns):
                     line.pop(x, None)
+                # and a link span may not name a column which no longer exists
+                self.clip_links(line, columns)
 
         self.lines, self.columns = lines, columns
 
@@ -402,6 +544,16 @@ class TerminalScreen(pyte.Screen):
                 continue
 
             if char_width > 0:
+                if self._link is not None or (self._link_seen and line_links(line)):
+                    # the cells which were just written join the link which is open,
+                    # or leave the one they used to be part of. this guard sits in
+                    # the hottest loop of the terminal, so a session which never saw
+                    # a hyperlink at all pays two attribute reads for it
+                    self.link_cells(
+                        self.cursor.y,
+                        self.cursor.x,
+                        min(self.cursor.x + char_width, self.columns),
+                        self._link)
                 self.cursor.x = min(self.cursor.x + char_width, self.columns)
 
         self.dirty.add(self.cursor.y)
@@ -450,17 +602,89 @@ class TerminalScreen(pyte.Screen):
     # def delete_lines(self, count=None):
     #     pass
 
-    # def insert_characters(self, count=None):
-    #     pass
+    def insert_characters(self, count=None):
+        # the cells at the cursor and to the right of it move that far right, and the
+        # spans have to travel with the very cells they name. dropping them instead
+        # would be safe but wrong in the common case: draw() routes every single
+        # character through here while IRM is set, so a link typed in insert mode
+        # would collapse to its last cell
+        self.shift_links(self.cursor.y, self.cursor.x, count or 1)
+        super().insert_characters(count)
 
-    # def delete_characters(self, count=None):
-    #     pass
+    def delete_characters(self, count=None):
+        self.shift_links(self.cursor.y, self.cursor.x, -(count or 1))
+        super().delete_characters(count)
 
-    # def erase_characters(self, count=None):
-    #     pass
+    def shift_links(self, y, at, count):
+        """
+        move the spans of a line sideways with the cells they name. count > 0 is an
+        insert at column `at`, which pushes everything from there rightwards off the
+        end of the line, count < 0 is a delete, which pulls it leftwards. the cells
+        the insert opens up are blank and belong to no link, and the cells a delete
+        takes away take their part of a span with them
+        """
+        line = self.buffer.get(y)
+        if line is None:
+            return
+        spans = line_links(line)
+        if not spans:
+            return
 
-    # def erase_in_line(self, how=0, private=False):
-    #     pass
+        kept = []
+        for span in spans:
+            # whatever sat left of the cursor did not move
+            if span.start < at:
+                kept.append(HyperlinkSpan(span.start, min(span.end, at), span.link))
+            if count > 0:
+                start = max(span.start, at) + count
+                end = min(span.end + count, self.columns)
+            else:
+                # the cells between at and at - count are gone with the delete
+                start = max(span.start, at - count) + count
+                end = span.end + count
+            if start < end:
+                kept.append(HyperlinkSpan(start, end, span.link))
+
+        merged = []
+        for span in sorted(kept, key=lambda s: s.start):
+            # a delete closes the gap between the two halves of what used to be one
+            # span, and they are one span again
+            if merged and merged[-1].end == span.start and merged[-1].link is span.link:
+                merged[-1] = HyperlinkSpan(merged[-1].start, span.end, span.link)
+            else:
+                merged.append(span)
+
+        self.store_links(line, merged)
+
+    def erase_characters(self, count=None):
+        count = count or 1
+        # the erased cells are blanked in place, they are no longer inside whatever
+        # link used to cover them
+        self.link_cells(
+            self.cursor.y,
+            self.cursor.x,
+            min(self.cursor.x + count, self.columns),
+            None)
+        super().erase_characters(count)
+
+    def erase_in_line(self, how=0, private=False):
+        if how == 0:
+            self.link_cells(self.cursor.y, self.cursor.x, self.columns, None)
+            super().erase_in_line(how, private)
+        elif how == 1:
+            self.link_cells(self.cursor.y, 0, self.cursor.x + 1, None)
+            super().erase_in_line(how, private)
+        elif how == 2:
+            self.drop_links(self.cursor.y)
+            super().erase_in_line(how, private)
+        else:
+            # EL is defined for 0, 1 and 2 and xterm ignores every other parameter.
+            # pyte instead leaves its interval unbound and raises out of the middle
+            # of feed(), which used to take the rest of that chunk of output with it
+            # and, since the spans were dropped first, left this row's text on screen
+            # without its links. erasing on an undefined parameter would invent the
+            # data loss, so nothing happens here, exactly as on a real terminal
+            logger.debug("ignoring erase in line with the parameter {}".format(how))
 
     def erase_in_display(self, how=0, *args, **kwargs):
         # dump the screen to history
@@ -481,8 +705,9 @@ class TerminalScreen(pyte.Screen):
         for y in interval:
             line = self.buffer[y]
             # the cells are blanked in place, so the line object survives and would
-            # keep carrying the marks of the text which was just erased
+            # keep carrying the marks and the links of the text which was just erased
             self.drop_marks(y)
+            self.drop_links(y)
             for i, x in list(enumerate(line)):
                 if i < self.columns:
                     line[x] = self.cursor.attrs
@@ -498,6 +723,9 @@ class TerminalScreen(pyte.Screen):
 
         if how == 3:
             self.history.clear()
+            # the whole terminal is being emptied, an open link must not carry over
+            # into the text which is written after it
+            self.close_hyperlink()
             self._clear_callback()
 
     # def set_tab_stop(self):
@@ -613,8 +841,10 @@ class TerminalScreen(pyte.Screen):
         for y in range(top, bottom + 1):
             if y + n > bottom:
                 # clear() empties the cells but keeps the instance attributes, the
-                # marks of the line which just scrolled away have to go by hand
+                # marks and the links of the line which just scrolled away have to
+                # go by hand
                 self.drop_marks(y)
+                self.drop_links(y)
                 self.buffer[y].clear()
             else:
                 self.buffer[y] = copy(self.buffer[y + n])
@@ -625,6 +855,7 @@ class TerminalScreen(pyte.Screen):
         for y in reversed(range(top, bottom + 1)):
             if y - n < top:
                 self.drop_marks(y)
+                self.drop_links(y)
                 self.buffer[y].clear()
             else:
                 self.buffer[y] = copy(self.buffer[y - n])
@@ -691,6 +922,163 @@ class TerminalScreen(pyte.Screen):
             # newer shell, both are consumed and dropped
             logger.debug("ignoring osc 133 subcommand: {}".format(param))
 
+    def drop_links(self, y):
+        """
+        forget the hyperlink spans of a line which is about to be blanked in place
+        or whose cells are about to be shifted around
+        """
+        # the buffer is a defaultdict, get() keeps a row which does not exist yet
+        # from being materialized and handed to the renderer
+        line = self.buffer.get(y)
+        if line is not None and hasattr(line, "hyperlinks"):
+            del line.hyperlinks
+
+    def clip_links(self, line, columns):
+        """
+        drop what a line's spans say about columns which no longer exist, the screen
+        just became narrower
+        """
+        spans = line_links(line)
+        if not spans or spans[-1].end <= columns:
+            return
+        kept = []
+        for span in spans:
+            if span.start >= columns:
+                continue
+            if span.end > columns:
+                kept.append(HyperlinkSpan(span.start, columns, span.link))
+            else:
+                kept.append(span)
+        self.store_links(line, kept)
+
+    def store_links(self, line, spans):
+        """
+        put the spans on a buffer line, the tuple is rebound and never mutated in
+        place, a copy of this line in the scrollback shares the very same tuple
+        object with it
+        """
+        if spans:
+            line.hyperlinks = tuple(spans)
+            self._link_seen = True
+        elif hasattr(line, "hyperlinks"):
+            del line.hyperlinks
+
+    def link_cells(self, y, start, end, link):
+        """
+        Keep the hyperlink spans of a line in step with the cells which were just
+        written to it. The cells from start to end, end excluded, are put inside
+        link, or taken out of whatever span used to cover them when link is None.
+
+        This is where the granularity differs from an OSC 133 mark: a mark belongs
+        to a whole line, a link covers a run of cells which may start and end mid
+        line, and a link which survives a wrap simply covers a run on the next line
+        as well.
+        """
+        if start >= end:
+            return
+        line = self.buffer[y]
+        spans = line_links(line)
+        if link is None and not spans:
+            return
+        # how many cells this call covers, the merging below moves the bounds around
+        drawn = end - start
+
+        kept = []
+        for span in spans:
+            if span.end <= start or span.start >= end:
+                kept.append(span)
+                continue
+            # the cells were overwritten, whatever they pointed at only survives on
+            # either side of them
+            if span.start < start:
+                kept.append(HyperlinkSpan(span.start, start, span.link))
+            if span.end > end:
+                kept.append(HyperlinkSpan(end, span.end, span.link))
+
+        if link is not None:
+            for span in list(kept):
+                # the run which is being drawn now and the one drawn a moment ago
+                # are one span as soon as they touch, which is what keeps a link
+                # from costing one span per character
+                if span.link is link and (span.end == start or span.start == end):
+                    start = min(start, span.start)
+                    end = max(end, span.end)
+                    kept.remove(span)
+            kept.append(HyperlinkSpan(start, end, link))
+            if len(kept) > 1:
+                kept.sort(key=lambda s: s.start)
+
+        self.store_links(line, kept)
+
+        if link is not None and link is self._link:
+            # a shell may open a link and never close it, e.g. because the command
+            # printing it was killed halfway through. the link is dropped once it
+            # covered MAX_LINK_CELLS cells, so the damage is bounded to a few
+            # screens of text instead of the rest of the session
+            self._link_cells += drawn
+            if self._link_cells > MAX_LINK_CELLS:
+                logger.debug("hyperlink left open, dropping it: {}".format(link.uri))
+                self.close_hyperlink()
+
+    def intern_link(self, uri, link_id):
+        """
+        one Hyperlink instance per target, so that a log full of the same link keeps
+        one copy of the url and a reference per run of text
+        """
+        key = (link_id, uri)
+        link = self._link_cache.get(key)
+        if link is None:
+            if len(self._link_cache) >= MAX_LINK_CACHE:
+                # the cache exists only so that equal targets share one object,
+                # forgetting it costs nothing but a little duplication further on
+                self._link_cache.clear()
+            link = Hyperlink(uri, link_id)
+            self._link_cache[key] = link
+        return link
+
+    def close_hyperlink(self):
+        """
+        no cell drawn from here on is inside a hyperlink
+        """
+        self._link = None
+        self._link_cells = 0
+
+    def set_hyperlink(self, param):
+        # OSC 8 opens a hyperlink, e.g. ESC]8;id=42;https://example.com ESC\, and
+        # ESC]8;; ESC\ closes it again. everything drawn while one is open belongs
+        # to it, including what is drawn after a wrap
+        params, sep, uri = param.partition(";")
+        if not sep:
+            # not a well formed sequence, and the safe reading of it is "no link"
+            self.close_hyperlink()
+            return
+
+        uri = safe_link_uri(uri)
+        if not uri:
+            # an empty target is the closing sequence, a refused one is a target we
+            # will not store, and neither may leave the previous link open
+            self.close_hyperlink()
+            return
+
+        link_id = ""
+        for pair in params.split(":"):
+            key, has_value, value = pair.partition("=")
+            if not has_value:
+                continue
+            if key.strip() == "id":
+                link_id = UNSAFE_IN_URI.sub("", value)
+                if len(link_id) > MAX_LINK_ID_LENGTH:
+                    # truncating would tie two links which merely share a long prefix
+                    # together, and an id only ever joins runs of one link, so an
+                    # oversized one is dropped instead. the link itself still stands
+                    logger.debug("oversized osc 8 id dropped")
+                    link_id = ""
+            # every other key belongs to a newer terminal than this one and is
+            # ignored on purpose, an unknown one is never a reason to fail
+
+        self._link = self.intern_link(uri, link_id)
+        self._link_cells = 0
+
     def set_cwd(self, param):
         # OSC 7 reports the working directory as a file uri every time it changes,
         # e.g. ESC]7;file://hostname/home/user/project ESC\
@@ -726,6 +1114,9 @@ class TerminalScreen(pyte.Screen):
         self._alternate_buffer_mode = value
 
     def switch_to_screen(self, alt=False):
+        # the buffer which is drawn to is about to be a different one, a link left
+        # open by the application being entered or left must not cover it
+        self.close_hyperlink()
         if alt:
             self.primary_buffer["buffer"] = self.buffer
             self.primary_buffer["history"] = self.history
@@ -749,6 +1140,7 @@ class TerminalScreen(pyte.Screen):
                 for x in list(line.keys()):
                     if x >= self.columns:
                         line.pop(x, None)
+                self.clip_links(line, self.columns)
 
         self.dirty.update(range(self.lines))
 
@@ -778,6 +1170,11 @@ MAX_OSC_CODE_LENGTH = 5
 MAX_OSC_PARAM_LENGTH = 4096
 # OSC 1337 of the iTerm2 inline image protocol carries base64 encoded image data
 MAX_OSC_IMAGE_PARAM_LENGTH = 4 * 1024 * 1024
+# OSC 8 carries its params and its target, and safe_link_uri is the one place which
+# decides that a target is too long. giving the sequence room for the longest one it
+# could legitimately carry keeps that decision there and not here, where a discarded
+# sequence would leave the previous link open, see the overflow branch below
+MAX_OSC_LINK_PARAM_LENGTH = MAX_LINK_URI_LENGTH + MAX_LINK_ID_LENGTH + 64
 
 
 def flatten_csi_subparams(subparams):
@@ -822,6 +1219,7 @@ class TerminalStream(pyte.Stream):
             "1": "set_icon_name",
             "2": "set_title",
             "7": "set_cwd",
+            "8": "set_hyperlink",
             # the dispatch table is captured by value when the parser generator is
             # built in super().__init__(), an entry added afterwards is never
             # dispatched, so every osc code belongs in this literal
@@ -1008,6 +1406,8 @@ class TerminalStream(pyte.Stream):
                             in_code = False
                             if code == "1337":
                                 limit = MAX_OSC_IMAGE_PARAM_LENGTH
+                            elif code == "8":
+                                limit = MAX_OSC_LINK_PARAM_LENGTH
                         elif len(code) < MAX_OSC_CODE_LENGTH:
                             code += char
                         else:
@@ -1023,6 +1423,13 @@ class TerminalStream(pyte.Stream):
 
                 if overflow:
                     logger.debug("oversized osc sequence discarded: {}".format(code))
+                    if code == "8":
+                        # every other malformed OSC 8 closes the link which is open,
+                        # and this one must too. dropping it silently would leave the
+                        # link a previous sequence opened attached to everything the
+                        # oversized one was trying to retarget, i.e. the text of a
+                        # benign link would keep pointing at whatever was open before
+                        osc_dispatch["8"]("")
                     continue
 
                 if code in osc_dispatch:
