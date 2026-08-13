@@ -30,14 +30,33 @@ def available_panel_name(window, panel_name):
             count += 1
 
 
+# where the region key counter starts over. the colors of a row and the underlines of
+# its hyperlinks both come out of it, so a busy terminal climbs it twice as fast as it
+# used to and the wrap is worth getting right
+MAX_HIGHLIGHT_KEY = 100000000
+
+
 def get_highlight_key(view):
     """
     make region keys incremental and recyclable
     """
     value = view.settings().get("terminus.highlight_counter", 0)
 
-    if value == 1e8:
+    if value >= MAX_HIGHLIGHT_KEY:
+        # starting over at terminus#1 hands out a key a row on screen is still
+        # holding: add_regions would replace that row's regions with these, and that
+        # row's erase_regions would then take these away again. the walk below only
+        # works downwards from a counter which is above everything in use, so on the
+        # wrap the first key nobody holds has to be found from the bottom
         value = 0
+        while value < MAX_HIGHLIGHT_KEY:
+            regions = view.get_regions("terminus#{}".format(value + 1))
+            if not regions or regions[0].empty():
+                break
+            value += 1
+        value += 1
+        view.settings().set("terminus.highlight_counter", value)
+        return "terminus#{}".format(value)
 
     while value >= 1:
         regions = view.get_regions("terminus#{}".format(value))

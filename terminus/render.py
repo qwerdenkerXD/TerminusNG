@@ -10,11 +10,20 @@ from wcwidth import wcswidth
 
 
 from .const import CONTINUATION
-from .ptty import XTERM_256_COLORS, line_marks
+from .ptty import XTERM_256_COLORS, EMPTY_LINKS, line_marks, line_links
 from .terminal import Terminal
 from .utils import rev_wcwidth, get_highlight_key
 
 logger = logging.getLogger('Terminus')
+
+
+# the scope the underline of an OSC 8 hyperlink is drawn in. it is the scope color
+# schemes already give links, so a terminal link picks up the same color the rest of
+# the editor uses, and a user who wants another one only has to add a rule for it
+LINK_SCOPE = "markup.underline.link.terminus"
+# only the underline is drawn, no fill and no outline, so the foreground and the
+# background the escape sequences asked for stay exactly as they are
+LINK_FLAGS = sublime.DRAW_NO_FILL | sublime.DRAW_NO_OUTLINE | sublime.DRAW_SOLID_UNDERLINE
 
 
 @lru_cache(maxsize=10000)
@@ -101,6 +110,191 @@ def segment_buffer_line(buffer_line):
     yield text, start, counter, fg, bg, bold
 
 
+def column_offsets(buffer_line):
+    """
+    map the cell columns of a buffer line onto the columns of the text `update_line`
+    writes for it, and return that map together with the width of the text.
+
+    the two only agree while the line holds no wide character: `segment_buffer_line`
+    emits one character per cell and skips the second half of a wide one, so every
+    wide character moves the text one column left of the cell grid. a hyperlink span
+    names cells, a region names text, this is the step in between
+    """
+    offsets = {}
+    index = 0
+    is_wide_char = False
+
+    if buffer_line:
+        last_index = max(buffer_line.keys()) + 1
+    else:
+        last_index = 0
+
+    for i in range(last_index):
+        offsets[i] = index
+        if is_wide_char:
+            # the second half of a wide character carries no character of its own
+            is_wide_char = False
+            continue
+        is_wide_char = wcswidth(buffer_line[i].data) >= 2
+        index += 1
+
+    # the exclusive end of the last cell, i.e. the column just past the text
+    offsets[last_index] = index
+    return offsets, index
+
+
+def text_column(offsets, width, column):
+    """
+    the text column a cell column lands on, the end of the text for a cell which was
+    never written. a span may name a cell past the last one the line kept
+    """
+    if column in offsets:
+        return offsets[column]
+    return width
+
+
+class RowLink:
+    """
+    a run of one view row which sits inside an OSC 8 hyperlink. start is inclusive,
+    end is exclusive and both are columns of the row's text, the same columns
+    `colorize_line` colors by. link is the shared Hyperlink ptty.py interned, so
+    `one.link is other.link` still answers whether two runs are one link.
+
+    a RowLink is never modified once it is built, `relink_line` replaces the whole
+    tuple of a row instead
+    """
+    __slots__ = ("start", "end", "link")
+
+    def __init__(self, start, end, link):
+        self.start = start
+        self.end = end
+        self.link = link
+
+    @property
+    def uri(self):
+        return self.link.uri
+
+    @property
+    def link_id(self):
+        return self.link.link_id
+
+    def __repr__(self):
+        return "RowLink({}, {}, {})".format(self.start, self.end, self.link)
+
+
+class LinkIndex:
+    """
+    the OSC 8 hyperlinks of the rows of one view: row -> (region key, tuple of
+    RowLink). it is the counterpart of `colored_lines`, a row is established by the
+    same pass which writes that row's text and dropped the moment the text goes.
+
+    the runs are kept next to the key because a view region carries no target: the
+    underline says there is a link, this says which one. all the runs of a row share
+    a single key, so a build log full of links costs one `add_regions` per row and
+    not one per link
+    """
+
+    def __init__(self):
+        self.rows = {}
+
+    def set_line(self, view, line, links, regions):
+        self.drop_line(view, line)
+        if not links:
+            return
+        key = get_highlight_key(view)
+        view.add_regions(key, regions, LINK_SCOPE, flags=LINK_FLAGS)
+        self.rows[line] = (key, links)
+
+    def drop_line(self, view, line):
+        entry = self.rows.pop(line, None)
+        if entry:
+            view.erase_regions(entry[0])
+
+    def line_links(self, line):
+        entry = self.rows.get(line)
+        if not entry:
+            return EMPTY_LINKS
+        return entry[1]
+
+    def clear(self, view):
+        for line in list(self.rows.keys()):
+            self.drop_line(view, line)
+
+    def shift(self, view, m):
+        """
+        the top m rows are about to be erased: their keys are dropped outright, a
+        clamped one would underline text which has nothing to do with the link, and
+        the rest moves up with the text exactly the way `colored_lines` does
+        """
+        for line in list(self.rows.keys()):
+            if line < m:
+                self.drop_line(view, line)
+        self.rows = {k - m: v for (k, v) in self.rows.items()}
+
+
+# the link index of every view which has one, view id -> LinkIndex. the index of a
+# view belongs to the render command of that view, this map only makes it reachable
+# from mouse.py, which has a point and a view and nothing else. a view which stops
+# being a terminal is forgotten, see `register_link_index`
+_link_indexes = {}
+
+
+def register_link_index(view, index):
+    """
+    publish the index of a view, so that the read side below can find it
+    """
+    vid = view.id()
+    if _link_indexes.get(vid) is not index:
+        # a new view is joining the map, take the chance to forget the views which
+        # are not terminals any more. an entry is only ever rebuilt by a render of
+        # the view it belongs to, so dropping one can never lose a live row
+        for other in list(_link_indexes.keys()):
+            if Terminal.from_id(other) is None:
+                del _link_indexes[other]
+        _link_indexes[vid] = index
+
+
+def row_links(view, row):
+    """
+    the RowLink runs of a view row, ordered by column and non overlapping. it is the
+    shared EMPTY_LINKS tuple when the row holds no link. treat it as immutable
+    """
+    index = _link_indexes.get(view.id())
+    if index is None:
+        return EMPTY_LINKS
+    return index.line_links(row)
+
+
+def link_at_point(view, point):
+    """
+    the Hyperlink the text under a point belongs to, or None. read `.uri` for the
+    target and `.link_id` for the id= the shell sent, if any
+    """
+    row_link = row_link_at_point(view, point)
+    if row_link is None:
+        return None
+    return row_link.link
+
+
+def row_link_at_point(view, point):
+    """
+    the RowLink under a point, or None
+    """
+    row, col = view.rowcol(point)
+    for row_link in row_links(view, row):
+        if row_link.start <= col < row_link.end:
+            return row_link
+    return None
+
+
+# there is deliberately nothing here which joins the runs of a wrapped link back
+# together for the sake of a highlight. `relink_line` underlines every run of every
+# row as it writes it, so the halves of a wrapped link are already drawn as links and
+# a walk over the neighbouring rows would add no pixel to what is on screen. the one
+# thing such a walk could do is take one run's target and paint it over another run,
+# which is precisely what an id= out of a hostile stream would be for
+
+
 class TerminusViewMixin:
 
     def ensure_position(self, edit, row, col=0):
@@ -119,9 +313,14 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
         super().__init__(*args, **kwargs)
         # it keeps all the highlight keys
         self.colored_lines = {}
+        # and this keeps the OSC 8 hyperlinks of the rows, the same way, see LinkIndex
+        self.links = LinkIndex()
         settings = sublime.load_settings("Terminus.sublime-settings")
         self.scrollback_history_size = settings.get("scrollback_history_size", 10000)
         self.brighten_bold_text = settings.get("brighten_bold_text", False)
+        # with this off no row is ever put in the index, so nothing is underlined and
+        # mouse.py finds no link to open either, which is the whole of the opt out
+        self.hyperlinks = settings.get("hyperlinks", True)
 
     def run(self, edit):
         view = self.view
@@ -132,6 +331,11 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
 
         screen = terminal.screen
 
+        # mouse.py has a view and a point and no way to reach this instance, hand it
+        # the index of this view. it is the same object across renders, so this is a
+        # lookup and nothing else once the view is known
+        register_link_index(view, self.links)
+
         if terminal._pending_to_clear_scrollback[0]:
             view.replace(edit, sublime.Region(0, view.size()), "")  # nuke everything
             # the text is gone, so all the color regions are empty now, drop them and
@@ -139,6 +343,10 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
             # to descend the whole counter one step at a time
             for line in list(self.colored_lines.keys()):
                 self.decolorize_line(line)
+            # the link underlines are keys out of the very same counter, they have to
+            # go before it is rewound or `get_highlight_key` hands out a key which is
+            # still in use here
+            self.links.clear(view)
             view.settings().set("terminus.highlight_counter", 0)
             # the rows the marks name are gone with the text
             terminal.marks.clear()
@@ -197,6 +405,7 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
                 row = offset - line - 1
                 self.update_line(edit, row, buffer_line, lf)
                 self.remark_line(terminal, row, buffer_line)
+                self.relink_line(row, buffer_line)
 
             # update dirty line¡s
             logger.debug("screen is dirty: {}".format(str(dirty_lines)))
@@ -206,6 +415,7 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
                 row = line + offset
                 self.update_line(edit, row, buffer_line, lf)
                 self.remark_line(terminal, row, buffer_line)
+                self.relink_line(row, buffer_line)
 
     def remark_line(self, terminal, line, buffer_line):
         """
@@ -219,6 +429,38 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
             # whatever line occupies the row now carries no mark, so the row does
             # not either, an entry left behind would name text which is gone
             terminal.marks.pop(line, None)
+
+    def relink_line(self, line, buffer_line):
+        """
+        mirror the OSC 8 hyperlinks of a buffer line onto the view row it was just
+        written to and underline them, that write is the only place a link becomes a
+        row. same as the marks above: whatever line occupies the row now decides,
+        an entry left behind would point at text which is gone
+        """
+        view = self.view
+        spans = line_links(buffer_line) if self.hyperlinks else EMPTY_LINKS
+        if not spans:
+            self.links.drop_line(view, line)
+            return
+
+        offsets, width = column_offsets(buffer_line)
+        line_region = view.line(view.text_point(line, 0))
+        begin = line_region.begin()
+        # the text was rstripped and may be shorter than the cells the spans name
+        last = line_region.end() - begin
+
+        links = []
+        regions = []
+        for span in spans:
+            a = min(text_column(offsets, width, span.start), last)
+            b = min(text_column(offsets, width, span.end), last)
+            if b <= a:
+                # the run is entirely inside the trailing space which was stripped
+                continue
+            links.append(RowLink(a, b, span.link))
+            regions.append(sublime.Region(begin + a, begin + b))
+
+        self.links.set_line(view, line, tuple(links), regions)
 
     def update_line(self, edit, line, buffer_line, lf):
         view = self.view
@@ -299,6 +541,9 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
                 # alive, it only ever follows it. the buffer line still carries it
                 # and the next write of that row brings it back
                 terminal.marks.pop(row, None)
+                # the same goes for the links of the row, the underline would sit on
+                # whatever text ends up on that row next
+                self.links.drop_line(view, row)
                 row = row - 1
             else:
                 break
@@ -331,6 +576,9 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
             # clamped one would be a phantom prompt sitting on row 0 forever. the
             # rest shifts with the text, the same way colored_lines does above
             terminal.marks = {k - m: v for (k, v) in terminal.marks.items() if k >= m}
+            # and the link rows, which own view regions, so they are erased and not
+            # only forgotten, see LinkIndex.shift
+            self.links.shift(view, m)
             top_region = sublime.Region(0, view.line(view.text_point(m - 1, 0)).end() + 1)
             view.erase(edit, top_region)
             terminal.offset -= m
@@ -348,6 +596,7 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
                 row = view.rowcol(line.begin())[0]
                 self.decolorize_line(row)
                 terminal.marks.pop(row, None)
+                self.links.drop_line(view, row)
             view.erase(edit, tail_region)
 
 
