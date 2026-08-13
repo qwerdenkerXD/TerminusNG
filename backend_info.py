@@ -221,11 +221,19 @@ def winpty_lines():
 
     backends = getattr(getattr(winpty, "enums", None), "Backend", None)
     if backends is not None:
+        members = []
         try:
-            lines.append(field("enums.Backend", ", ".join(
-                "{}={}".format(member.name, member.value) for member in backends)))
+            # a plain python enum iterates, the rust backed class of pywinpty 2.x
+            # does not, so fall back to reading the members we know it defines
+            members = ["{}={}".format(m.name, m.value) for m in backends]
+        except TypeError:
+            for name in ["ConPTY", "WinPTY"]:
+                value = getattr(backends, name, None)
+                if value is not None:
+                    members.append("{}={}".format(name, getattr(value, "value", value)))
         except Exception as e:
-            lines.append(field("enums.Backend", "unreadable: {}".format(describe_error(e))))
+            members = ["unreadable: {}".format(describe_error(e))]
+        lines.append(field("enums.Backend", ", ".join(members) if members else "<empty>"))
     else:
         lines.append(field("enums.Backend", "<none>"))
 
