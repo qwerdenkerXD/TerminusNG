@@ -1,67 +1,165 @@
-# Bring a real terminal to Sublime Text
+# TerminusNG
 
-[![Package Control Downloads](https://img.shields.io/packagecontrol/dm/Terminus)](https://packagecontrol.io/packages/Terminus)
-<a href="https://www.paypal.me/randy3k/5usd" title="Donate to this project using Paypal"><img src="https://img.shields.io/badge/paypal-donate-blue.svg" /></a>
+A hardened fork of [Terminus](https://github.com/randy3k/Terminus), the cross-platform
+terminal for Sublime Text, by [@randy3k](https://github.com/randy3k). MIT, same as
+upstream. Forked from `master` at `0cccd3f`.
 
+Everything upstream does, it still does — this is surgical hardening, not a rewrite.
+The usage documentation below is upstream's and still applies.
 
-The first cross platform terminal for Sublime Text.
+## Why
 
-<table>
-    <tr>
-        <th>Unix shell</th>
-        <th>Cmd.exe</th>
-    </tr>
-    <tr>
-        <td width="50%">
-            <a href="https://user-images.githubusercontent.com/1690993/41784539-03534fdc-760e-11e8-845d-3d133a559df5.gif">
-                <img src="https://user-images.githubusercontent.com/1690993/41784539-03534fdc-760e-11e8-845d-3d133a559df5.gif" width="100%">
-            </a>
-        </td>
-        <td width="50%">
-            <a href="https://user-images.githubusercontent.com/1690993/41786131-a625d870-7612-11e8-882d-f1574184faba.gif">
-                <img src="https://user-images.githubusercontent.com/1690993/41786131-a625d870-7612-11e8-882d-f1574184faba.gif" width="100%">
-            </a>
-        </td>
-    </tr>
-    <tr>
-        <th>Terminal in panel</th>
-        <th>Support <a href="https://www.iterm2.com/documentation-images.html">showing images</a></th>
-    </tr>
-    <tr>
-        <td width="50%">
-            <a href="https://user-images.githubusercontent.com/1690993/41784748-a7ed9d90-760e-11e8-8979-dd341933f1bb.gif">
-                <img src="https://user-images.githubusercontent.com/1690993/41784748-a7ed9d90-760e-11e8-8979-dd341933f1bb.gif" width="100%">
-            </a>
-        </td>
-        <td width="50%">
-            <img src="https://user-images.githubusercontent.com/1690993/51725223-1dfa3780-202f-11e9-9600-6e24b78d562d.png" width="100%">
-        </td>
-    </tr>
-</table>
+Two bugs, both with small root causes:
 
-This package is heavily inspired by [TerminalView](https://github.com/Wramberg/TerminalView). Compare with TerminalView, this has
+**Home and End did nothing.** `key.py` sent `ESC[1~` / `ESC[4~`, the `TERM=linux`
+console codes, while the shipped default is `xterm-256color`, whose terminfo declares
+`khome=\EOH` / `kend=\EOF`. Readline waited for bytes that never arrived, so the keys
+were silently unbound — dead in zsh, fish, `bash -o vi`, `less` and the Python REPL.
+ConPTY accepts all three sequence families, so this never reproduced on Windows
+native, only under WSL and Unix.
 
-- Windows support
-- continuous history
-- easily customizable themes (see Terminus Utilities)
-- unicode support
-- 256 colors support
-- better xterm support
-- terminal panel
-- [imgcat](https://www.iterm2.com/documentation-images.html) support (PS: it also works on Linux / WSL)
+**Resizing the pane killed the terminal.** `view_size()` has two escape hatches for an
+unmeasurable viewport, both keyed on its `default` argument — and the resize path
+passed none. Mid-drag `viewport_extent()` reads `(0,0)`, the terminal was resized to
+**one row**, which SIGWINCHes `vim`/`less`/`htop` into exiting, and `auto_close` then
+closed the tab.
+
+## What is different
+
+### Input
+- Home/End emit the correct sequences in all three forms: `ESC[H`/`ESC[F` normally,
+  `ESC OH`/`ESC OF` under DECCKM, `ESC[1;{m}H` with a modifier. Any modifier forces
+  CSI, never SS3.
+- Modifiers compose. `get_key_code` branched `if ctrl / elif alt / elif shift`, so
+  `ctrl+alt+f` sent only `\x06`. It uses the xterm modifier bitmask now.
+- Modified Home/End no longer emit `ESC[1;5~`, which belongs to neither escape family.
+- `f11` was missing from the key table and typed the literal string `f11`.
+
+### Stability
+- The renderer no longer tears a terminal down on a single transient "unhosted"
+  reading; a view which is genuinely gone is still reaped promptly, so panel
+  terminals, which never get an `on_pre_close`, do not leak.
+- An exception in a dispatch handler no longer kills the render thread for good. The
+  pyte stream generator is restarted after a handler raises — previously any raise
+  closed it permanently and every later feed raised `StopIteration`, leaving the
+  terminal blank for the rest of its life.
+- A failed `spawn` no longer leaves a registered terminal with no process, which used
+  to make the view impossible to close for the rest of the session.
+- Resizing respects a `min_rows` floor and never sends a degenerate size.
+
+### Terminal emulation
+- Multi-digit OSC codes dispatch. `OSC 2` (window title) and `OSC 1337` (imgcat) were
+  unreachable because the parser read the code one character at a time.
+- `draw()` no longer discards the rest of a text run on a zero-width character, which
+  silently truncated any line containing an emoji variation selector or ZWJ.
+- Colon subparameters (`ESC[38:2::r:g:b`, used by neovim and delta) are consumed
+  instead of leaking onto the screen as literal text.
+- `resize()` clamps the cursor, restores the alternate buffer at the right geometry,
+  and `reset()` clears alternate-buffer state — a `RIS` from the alt screen used to
+  kill scrollback silently for the rest of the session.
+- `index()` archives a line only when the scrolling region starts at the top, so a
+  pager's pinned status line is no longer copied into the scrollback on every scroll.
+
+### Shell integration
+See [SHELL_INTEGRATION.md](SHELL_INTEGRATION.md) for the snippets.
+
+- **OSC 7** — the shell reports its working directory, and a terminal opened from a
+  terminal starts there.
+- **OSC 133** — semantic prompt marking, powering *Jump to Previous/Next Prompt*,
+  *Select Command Output* and *Copy Command Output*. Optional gutter markers, red for
+  a command that exited non-zero (`prompt_markers`, off by default: a prompt that
+  reports OSC 133 usually shows its own exit status).
+- **OSC 8** — hyperlinks are underlined and clickable. Only `http`, `https` and `file`
+  targets are ever opened; the scheme is checked at parse time, after stripping
+  whitespace and control characters and after percent-decoding, so a refused target is
+  never stored. The hover popup shows the **host** first and on its own, because
+  `https://www.paypal.com@attacker.example/` reads as a bank for its first 22
+  characters, and bidi and zero-width characters are spelled out as `<U+202E>`.
+
+### Windows and WSL
+- `wsl.exe` inherits nothing from the Windows environment unless the variable is named
+  in `WSLENV`, so Terminus's own `TERM_PROGRAM == "Terminus-Sublime"` contract was
+  invisible inside WSL. `TERM`, `COLORTERM` and `TERM_PROGRAM` are now shared through
+  it, which is what makes the shell-integration snippets fire.
+- Paths are translated across the boundary (`/mnt/c/...` ↔ `C:\...`,
+  `/home/you` ↔ `\\wsl.localhost\<distro>\home\you`), so a reported cwd or a clicked
+  file link works from the Windows side.
+- Translation refuses rather than guesses. `--distribution-id` and `--system` name a
+  distribution in a form that cannot be resolved, and since the same posix path exists
+  in every installed distro, guessing would have opened a file from the wrong one.
+  Components ending in `.` or a space are refused too — Windows silently rewrites
+  them, so a link to `report.` would open `report`.
+- **Terminus Utilities: Backend Info** reports the PTY backend, pywinpty version and
+  ConPTY availability. Run it before reporting anything Windows-specific.
+
+### Performance
+- Paste is no longer capped at ~5 KiB/s by a fixed `sleep(0.1)` per 512 bytes; 1 MiB
+  used to take over three minutes.
+- Colour regions are batched by scope instead of one `add_regions` per segment.
+- The 256-colour scheme is regenerated when the theme's background actually changes.
+  It was only rewritten when forced, so switching dark↔light by editing settings left
+  256-colour cells rendering against the previous background.
+- The adaptive theme no longer overrides the editor's selection colours, so selecting
+  in a terminal looks like selecting anywhere else.
+
+## New settings
+
+| setting | default | |
+|---|---|---|
+| `min_rows` | `4` | floor for the terminal height; a one-row pty makes `vim`, `less` and `htop` unusable |
+| `follow_shell_cwd` | `true` | open a new terminal in the directory the current shell reported via OSC 7 |
+| `hyperlinks` | `true` | underline and open OSC 8 hyperlinks |
+| `prompt_markers` | `false` | gutter markers on prompt rows, red when the command failed |
+
+## New commands
+
+`Terminus: Jump to Previous Prompt` · `Terminus: Jump to Next Prompt` ·
+`Terminus: Select Command Output` · `Terminus: Copy Command Output` ·
+`Terminus: Open Shell Directory as Folder` · `Terminus Utilities: Backend Info`
+
+No key bindings are shipped for these. In a terminal almost every keystroke belongs to
+the shell, so binding them is left to you.
 
 ## Installation
 
-Package Control.
+Not on Package Control — clone it and shadow the installed package. An unpacked
+`Packages/Terminus` takes precedence over `Installed Packages/Terminus.sublime-package`,
+and the dependencies (`pyte`, `wcwidth`, `pywinpty`/`ptyprocess`) keep resolving
+because the package name is unchanged.
 
-### Getting started
+Windows:
 
-- run `Terminus: Open Default Shell in Tab`
+```cmd
+mklink /J "%APPDATA%\Sublime Text\Packages\Terminus" "<path to this repo>"
+```
 
-- [OdatNurd](https://github.com/OdatNurd) has made several videos on Terminus. See, for examples,
-    - https://www.youtube.com/watch?v=etIJMVIvVgg (most up to date)
-    - https://www.youtube.com/watch?v=mV0ghkMwTQc
+Linux / macOS:
 
+```sh
+ln -s <path to this repo> "$HOME/.config/sublime-text/Packages/Terminus"
+```
+
+Delete the link to go back to the Package Control copy.
+
+## Known limitations
+
+- **No truecolour.** `ESC[38;2;r;g;b` is parsed correctly but mapped to the nearest of
+  256 colours. Colours reach the view as scopes in a generated `.hidden-color-scheme`,
+  so 24-bit would mean writing and reloading a scheme file per novel colour. This is a
+  ceiling of Sublime's API, not of this fork — any in-editor terminal hits it.
+- **Sublime has no resize event.** [sublimehq/sublime_text#12](https://github.com/sublimehq/sublime_text/issues/12)
+  has been open since 2013; polling is the only available design.
+- `Default.sublime-keymap` is still 36 KB of hand-enumerated bindings. That is the
+  structural reason `f11` went missing for years. Generating it from a spec is the real
+  fix and has not been done.
+- Detached terminals still cannot be reattached after a tab closes. Run `tmux` inside
+  Terminus if you want that; it is better at it.
+- `reported_cwd` stats a UNC path on the UI thread, so a stopped WSL VM can stall
+  Sublime briefly when opening a terminal.
+
+---
+
+The rest of this document is upstream's, and still applies.
 
 ## Shell configurations
 
