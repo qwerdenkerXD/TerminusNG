@@ -91,6 +91,13 @@
     // programs such as vim, less or htop unusable, so keep this above 1.
     "min_rows": 4,
 
+    // open a new terminal in the working directory the current terminal's shell
+    // last reported through OSC 7, instead of in the first project folder. this
+    // needs the shell to report it, see "shell integration" in the readme. a
+    // directory this side of the pty cannot reach, such as one reported by a wsl
+    // or an ssh shell, is ignored.
+    "follow_shell_cwd": true,
+
     // force the terminal size
     "size": [null, null],
 

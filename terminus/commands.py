@@ -66,6 +66,29 @@ def is_wsl_command(cmd):
     return executable_name(args[0]) == "wsl"
 
 
+def reported_cwd(view):
+    """
+    The working directory a terminal view's shell last reported through OSC 7, if it
+    is a directory this side of the pty can actually reach. A wsl shell reports paths
+    from inside the distribution and a shell over ssh reports paths on the far host,
+    neither of which exist here, so an unreachable path is simply not used.
+    """
+    if not view:
+        return None
+    settings = sublime.load_settings("Terminus.sublime-settings")
+    if not settings.get("follow_shell_cwd", True):
+        return None
+    terminal = Terminal.from_id(view.id())
+    # screen only exists once the process has been spawned
+    screen = getattr(terminal, "screen", None) if terminal else None
+    if not screen:
+        return None
+    cwd = screen.cwd
+    if cwd and os.path.isdir(cwd):
+        return cwd
+    return None
+
+
 def share_env_with_wsl(env):
     """
     wsl.exe hands nothing of the windows environment to the distribution unless the
@@ -261,6 +284,11 @@ class TerminusOpenCommand(sublime_plugin.WindowCommand):
 
             if cwd:
                 cwd = sublime.expand_variables(cwd, st_vars)
+
+        if not cwd:
+            # a terminal opened from a terminal starts where that shell is, which is
+            # only known if the shell reports it through OSC 7, see the readme
+            cwd = reported_cwd(self.window.active_view())
 
         if not cwd:
             if self.window.folders():

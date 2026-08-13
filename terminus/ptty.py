@@ -6,6 +6,7 @@ from copy import copy
 from collections import defaultdict, deque, namedtuple
 from wcwidth import wcwidth, wcswidth
 from functools import lru_cache
+from urllib.parse import unquote, urlparse
 
 import pyte
 from pyte.screens import StaticDefaultDict, Margins
@@ -67,6 +68,39 @@ BG_AIXTERM = {
 }
 
 XTERM_256_COLORS = ANSI_COLORS + pyte.graphics.FG_BG_256
+
+
+def uri_to_path(uri):
+    """
+    Turn the file:// uri of an OSC 7 report into a path. The hostname is dropped,
+    a shell in a container or over ssh reports its own host and we have no way to
+    reach it anyway. Returns None if this is not a usable file uri.
+    """
+    if not uri:
+        return None
+    try:
+        parts = urlparse(uri)
+    except Exception:
+        return None
+    if parts.scheme and parts.scheme != "file":
+        return None
+    path = unquote(parts.path)
+    if not path:
+        return None
+    # a windows shell reports file:///C:/Users/..., the slash in front of the drive
+    # letter belongs to the uri, not to the path
+    if re.match(r"^/[a-zA-Z]:", path):
+        path = path[1:]
+    if re.match(r"^[a-zA-Z]:", path):
+        return path.replace("/", "\\")
+    if path.startswith("/"):
+        # a posix path, and on windows that means a wsl shell reporting a path from
+        # inside the distribution. it is left as it is rather than turned into
+        # something windows shaped, the caller decides whether it can reach it
+        return path
+    # OSC 7 always reports an absolute path, anything else is not a report we can
+    # make sense of
+    return None
 
 
 FILE_PARAM_PATTERN = re.compile(
@@ -159,6 +193,10 @@ class TerminalScreen(pyte.Screen):
         self.primary_buffer = {}
         self.history = deque(maxlen=history)
         self._alternate_buffer_mode = False
+        # the working directory the shell last reported through OSC 7, it is the
+        # shell's own view of it and may name a path which does not exist on this
+        # side of the pty, a wsl shell reports wsl paths
+        self.cwd = None
         super().__init__(*args, **kwargs)
 
     # @property
@@ -547,6 +585,14 @@ class TerminalScreen(pyte.Screen):
                 self.buffer[y] = copy(self.buffer[y - n])
         self.dirty.update(range(self.lines))
 
+    def set_cwd(self, param):
+        # OSC 7 reports the working directory as a file uri every time it changes,
+        # e.g. ESC]7;file://hostname/home/user/project ESC\
+        cwd = uri_to_path(param)
+        if cwd:
+            logger.debug("cwd reported: {}".format(cwd))
+            self.cwd = cwd
+
     def handle_iterm_protocol(self, param):
         m = FILE_PARAM_PATTERN.match(param)
         if m:
@@ -669,6 +715,7 @@ class TerminalStream(pyte.Stream):
             "0": "set_title",
             "1": "set_icon_name",
             "2": "set_title",
+            "7": "set_cwd",
             "1337": "handle_iterm_protocol"
         }
         self.yield_what = None
