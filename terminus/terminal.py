@@ -10,7 +10,7 @@ from queue import Queue, Empty
 
 from .ptty import TerminalPtyProcess, TerminalScreen, TerminalStream
 from .utils import responsive, intermission
-from .view import get_panel_window, view_size
+from .view import get_panel_window, panel_is_visible, view_is_visible, view_size
 from .key import get_key_code
 from .image import get_image_info, image_resize
 
@@ -26,6 +26,9 @@ body {{
 
 logger = logging.getLogger('Terminus')
 
+# how often a rejected resize to the very same size is retried before it is given up on
+MAX_RESIZE_ATTEMPTS = 5
+
 
 class Terminal:
     _terminals = {}
@@ -33,15 +36,22 @@ class Terminal:
 
     def __init__(self, view=None):
         self.view = view
+        self.process = None
         self._cached_cursor = [0, 0]
         self._size = sublime.load_settings('Terminus.sublime-settings').get('size', (None, None))
         self._cached_cursor_is_hidden = [True]
         self.image_count = 0
         self.images = {}
+        # whether the child process runs under TERM=linux, see the unix_term setting
+        self.linux_mode = False
         self._strings = Queue()
         self._pending_to_send_string = [False]
         self._pending_to_clear_scrollback = [False]
         self._pending_to_reset = [None]
+        # the size the pty was last known to agree on, None until the process is spawned
+        self._pty_size = None
+        self._failed_size = None
+        self._resize_failures = 0
         self.lock = threading.Lock()
 
     @classmethod
@@ -109,6 +119,21 @@ class Terminal:
             return True
         return self.window is not None
 
+    def can_be_resized(self):
+        # an unmeasurable viewport, e.g. during a pane drag, a layout change or when the
+        # window is minimized, would report a bogus size, better not to resize at all
+        if self.detached or not self.view:
+            return False
+        if self._size and all(self._size):
+            # the size is forced by the settings, it does not depend on the viewport
+            return True
+        if self.show_in_panel:
+            if not panel_is_visible(self.view):
+                return False
+        elif not view_is_visible(self.view):
+            return False
+        return all(self.view.viewport_extent())
+
     def _need_to_render(self):
         flag = False
         if self.screen.dirty:
@@ -131,8 +156,17 @@ class Terminal:
 
         @responsive(period=1, default=False)
         def was_resized():
-            size = view_size(self.view, force=self._size)
-            return self.screen.lines != size[0] or self.screen.columns != size[1]
+            # keep the current size if the viewport cannot be measured
+            size = tuple(view_size(
+                self.view, default=(self.screen.lines, self.screen.columns), force=self._size))
+            if self._pty_size == size and \
+                    self.screen.lines == size[0] and self.screen.columns == size[1]:
+                # both the pty and the screen are already at the requested size
+                return False
+            if self._failed_size == size and self._resize_failures >= MAX_RESIZE_ATTEMPTS:
+                # this size keeps being rejected, stop retrying it every second
+                return False
+            return self.can_be_resized()
 
         def reader():
             while True:
@@ -156,21 +190,31 @@ class Terminal:
 
             def feed_data():
                 if len(data[0]) > 0:
-                    logger.debug("receieved: {}".format(data[0]))
-                    self.stream.feed(data[0])
-                    data[0] = ""
+                    logger.debug("receieved: %s", data[0])
+                    try:
+                        self.stream.feed(data[0])
+                    except Exception as e:
+                        # an exception escaping here would kill the renderer thread for good
+                        logger.error("error feeding data: %s", e)
+                    finally:
+                        # always drop the data, otherwise a poisonous sequence would be
+                        # fed again on every tick
+                        data[0] = ""
 
             while True:
                 with intermission(period=0.03), self.lock:
                     feed_data()
                     if not self.detached:
-                        if was_resized():
-                            self.handle_resize()
-                            self.view.run_command("terminus_show_cursor")
+                        try:
+                            if was_resized():
+                                self.handle_resize()
+                                self.view.run_command("terminus_show_cursor")
 
-                        if self._need_to_render():
-                            self.view.run_command("terminus_render")
-                            self.screen.dirty.clear()
+                            if self._need_to_render():
+                                self.view.run_command("terminus_render")
+                                self.screen.dirty.clear()
+                        except Exception as e:
+                            logger.error("error rendering: %s", e)
 
                     if done[0] or not self.is_hosted():
                         logger.debug("renderer breaks")
@@ -204,12 +248,7 @@ class Terminal:
             timeit=False):
 
         view = self.view
-        if view:
-            self.detached = False
-            Terminal._terminals[view.id()] = self
-        else:
-            Terminal._detached_terminals.append(self)
-            self.detached = True
+        self.detached = view is None
 
         self.show_in_panel = show_in_panel
         self.panel_name = panel_name
@@ -230,7 +269,26 @@ class Terminal:
         logger.debug("view size: {}".format(str(size)))
         _env = os.environ.copy()
         _env.update(env)
-        self.process = TerminalPtyProcess.spawn(cmd, cwd=cwd, env=_env, dimensions=size)
+        # the linux console home and end codes differ from the xterm ones, key.py stays
+        # settings free so the flag is derived here from the TERM the process gets
+        self.linux_mode = _env.get("TERM") == "linux"
+        try:
+            self.process = TerminalPtyProcess.spawn(cmd, cwd=cwd, env=_env, dimensions=size)
+        except Exception as e:
+            self.process = None
+            logger.error("error spawning {}: {}".format(cmd, e))
+            # a terminal without a process must not be left registered
+            if view and Terminal._terminals.get(view.id()) is self:
+                del Terminal._terminals[view.id()]
+            if self in Terminal._detached_terminals:
+                Terminal._detached_terminals.remove(self)
+            if view:
+                # the view is no longer backed by a terminal, mark it finished so that
+                # on_activated does not keep reactivating a command which cannot spawn
+                view.settings().set("terminus_view.finished", True)
+            raise
+        # the pty was spawned with these dimensions, so it already agrees with the screen
+        self._pty_size = tuple(size)
         self.screen = TerminalScreen(
             size[1], size[0], process=self.process, history=10000,
             clear_callback=self.clear_callback, reset_callback=self.reset_callback)
@@ -238,26 +296,54 @@ class Terminal:
 
         self.screen.set_show_image_callback(self.show_image)
 
+        # only publish the terminal once the process is running
+        if view:
+            Terminal._terminals[view.id()] = self
+        else:
+            Terminal._detached_terminals.append(self)
+
         self._start_rendering()
 
     def kill(self):
         logger.debug("kill")
 
-        self.process.terminate()
-        vid = self.view.id()
-        if vid in self._terminals:
-            del self._terminals[vid]
+        if self.process:
+            self.process.terminate()
+        view = self.view
+        if view:
+            # view is None if the terminal has been detached
+            vid = view.id()
+            if vid in self._terminals:
+                del self._terminals[vid]
 
     def handle_resize(self):
-        size = view_size(self.view, force=self._size)
+        # keep the current size if the viewport cannot be measured
+        size = tuple(view_size(
+            self.view, default=(self.screen.lines, self.screen.columns), force=self._size))
         logger.debug("handle resize {} {} -> {} {}".format(
             self.screen.lines, self.screen.columns, size[0], size[1]))
         try:
-            # pywinpty will rasie an runtime error
-            self.process.setwinsize(*size)
+            # pywinpty will rasie an runtime error, newer versions raise a WinptyError
+            # which is not a RuntimeError, hence the broad except below
+            if self.process:
+                self.process.setwinsize(*size)
+            # the screen is only resized once the pty agreed on the new geometry,
+            # otherwise the child process and the screen would disagree on the number
+            # of columns and every line would be wrapped at the wrong place
             self.screen.resize(*size)
-        except RuntimeError:
-            pass
+        except Exception as e:
+            # count the failures so that a size which is rejected over and over is
+            # eventually given up on instead of being retried forever
+            if self._failed_size == size:
+                self._resize_failures += 1
+            else:
+                self._failed_size = size
+                self._resize_failures = 1
+            logger.error("error resizing to {}: {}".format(size, e))
+            return
+        self._pty_size = size
+        self._failed_size = None
+        self._resize_failures = 0
 
     def clear_callback(self):
         self._pending_to_clear_scrollback[0] = True
@@ -271,6 +357,7 @@ class Terminal:
     def send_key(self, *args, **kwargs):
         kwargs["application_mode"] = self.application_mode_enabled()
         kwargs["new_line_mode"] = self.new_line_mode_enabled()
+        kwargs["linux_mode"] = self.linux_mode
         self.send_string(get_key_code(*args, **kwargs), normalized=False)
 
     def send_string(self, string, normalized=True):
@@ -390,7 +477,8 @@ class Terminal:
 
     def __del__(self):
         # make sure the process is terminated
-        self.process.terminate(force=True)
+        if self.process:
+            self.process.terminate(force=True)
 
         # remove images
         for image_path in list(self.images.values()):
@@ -399,7 +487,7 @@ class Terminal:
             except Exception:
                 pass
 
-        if self.process.isalive():
+        if self.process and self.process.isalive():
             logger.debug("process becomes orphaned")
         else:
             logger.debug("process is terminated")

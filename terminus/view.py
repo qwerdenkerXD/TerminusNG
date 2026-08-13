@@ -1,25 +1,35 @@
 import sublime
 import sublime_plugin
 
+import logging
 import re
 
 
-def get_panel_window(view):
+logger = logging.getLogger('Terminus')
+
+# columns reserved on the right hand side of the viewport, they are covered by
+# the vertical scrollbar and the right margin and hence not usable for text
+RESERVED_COLUMNS = 3
+
+
+def find_panel(view):
+    # returns (window, panel name) of the output panel hosting `view`,
+    # (None, None) if `view` is not an output panel of any window
     for w in sublime.windows():
         for panel in w.panels():
-            v = w.find_output_panel(panel.replace("output.", ""))
+            name = panel.replace("output.", "")
+            v = w.find_output_panel(name)
             if v and v.id() == view.id():
-                return w
-    return None
+                return (w, name)
+    return (None, None)
+
+
+def get_panel_window(view):
+    return find_panel(view)[0]
 
 
 def get_panel_name(view):
-    for w in sublime.windows():
-        for panel in w.panels():
-            v = w.find_output_panel(panel.replace("output.", ""))
-            if v and v.id() == view.id():
-                return panel.replace("output.", "")
-    return None
+    return find_panel(view)[1]
 
 
 def panel_is_visible(view):
@@ -45,17 +55,24 @@ def view_size(view, default=None, force=None):
     if force:
         if all(force):
             return force
+    settings = sublime.load_settings("Terminus.sublime-settings")
+    min_rows = settings.get("min_rows", 4)
+    min_columns = settings.get("min_columns", 20)
+    max_columns = settings.get("max_columns", 500)
+
     pixel_width, pixel_height = view.viewport_extent()
     pixel_per_line = view.line_height()
     pixel_per_char = view.em_width()
 
-    if pixel_per_line == 0 or pixel_per_char == 0:
+    if pixel_width == 0 or pixel_height == 0 or pixel_per_line == 0 or pixel_per_char == 0:
+        # the viewport is not measurable, the view is either not laid out yet or
+        # not visible; any size derived from it would be degenerate
         if default:
             return default
-        else:
-            return (1, 1)
+        logger.debug("unmeasurable viewport, falling back to {} {}".format(min_rows, min_columns))
+        return (min_rows, min_columns)
 
-    nb_columns = int(pixel_width / pixel_per_char) - 3
+    nb_columns = int(pixel_width / pixel_per_char) - RESERVED_COLUMNS
     if nb_columns < 1:
         nb_columns = 1
 
@@ -66,13 +83,15 @@ def view_size(view, default=None, force=None):
     if nb_columns == 1 and default:
         return default
 
-    settings = sublime.load_settings("Terminus.sublime-settings")
-    min_columns = settings.get("min_columns", 20)
-    max_columns = settings.get("max_columns", 500)
     if nb_columns < min_columns:
         nb_columns = min_columns
     elif nb_columns > max_columns:
         nb_columns = max_columns
+
+    # a one row pty makes full screen programs such as vim, less or htop
+    # unusable, keep a floor under the number of rows as well
+    if nb_rows < min_rows:
+        nb_rows = min_rows
 
     return (nb_rows, nb_columns)
 

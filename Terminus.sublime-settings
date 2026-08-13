@@ -67,6 +67,8 @@
     // the default TERM variable of unix system. Possible values are
     // "linux", "xterm" and "xterm-256color".
     // However, please aware that not all xterm features are supported.
+    // setting this to "linux" also switches the home and end keys to the linux
+    // console codes instead of the xterm ones.
     "unix_term": "xterm-256color",
 
     // the default LANG variable of unix system.
@@ -79,6 +81,10 @@
     // set a minimum or maximum terminal width in characters
     "min_columns": 20,
     "max_columns": 500,
+
+    // set a minimum terminal height in lines. a one line terminal makes full screen
+    // programs such as vim, less or htop unusable, so keep this above 1.
+    "min_rows": 4,
 
     // force the terminal size
     "size": [null, null],
