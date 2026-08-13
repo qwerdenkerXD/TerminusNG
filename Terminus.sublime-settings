@@ -98,6 +98,14 @@
     // or an ssh shell, is ignored.
     "follow_shell_cwd": true,
 
+    // underline the hyperlinks a program marks with OSC 8, show their target when
+    // one is hovered and open it when the popup or the context menu entry is
+    // clicked. the text of such a link says nothing about where it points, so the
+    // popup shows the target itself. only http, https and file targets are ever
+    // opened, anything else is refused. with this off a link is drawn as ordinary
+    // text and only the plain urls in the text stay clickable, as they always were.
+    "hyperlinks": true,
+
     // force the terminal size
     "size": [null, null],
 

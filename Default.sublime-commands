@@ -71,6 +71,10 @@
         "command": "terminus_copy_command_output"
     },
     {
+        "caption": "Terminus: Open Shell Directory as Folder",
+        "command": "terminus_open_shell_folder"
+    },
+    {
         "caption": "Terminus Utilities: Select Theme",
         "command": "terminus_select_theme"
     },

@@ -15,6 +15,7 @@ from .terminal import Terminal
 from .utils import available_panel_name
 from .utils import shlex_split
 from .view import get_panel_window, get_panel_name, panel_is_visible, view_is_visible
+from .wsl import wsl_to_windows_for_cmd
 
 
 KEYS = [
@@ -67,12 +68,33 @@ def is_wsl_command(cmd):
     return executable_name(args[0]) == "wsl"
 
 
+def terminal_command(view):
+    """
+    the command a terminal view was started with, the way terminus_activate received
+    it. it is kept in the view settings and not on the terminal, and a reset, a
+    maximize and a minimize all carry those args over to the view they build, so it
+    is there for as long as the terminal is
+    """
+    if not view:
+        return None
+    args = view.settings().get("terminus_view.args", {})
+    if not isinstance(args, dict):
+        return None
+    return args.get("cmd", None)
+
+
 def reported_cwd(view):
     """
     The working directory a terminal view's shell last reported through OSC 7, if it
-    is a directory this side of the pty can actually reach. A wsl shell reports paths
-    from inside the distribution and a shell over ssh reports paths on the far host,
-    neither of which exist here, so an unreachable path is simply not used.
+    is a directory this side of the pty can actually reach. A shell over ssh reports
+    paths on the far host, which do not exist here, so an unreachable path is simply
+    not used.
+
+    A wsl shell also reports paths from inside the distribution, but those the windows
+    side can reach, under a drive letter or under the distribution's unc path, so they
+    are translated first. The distribution is the one the command names, never a
+    guessed one: the same posix path exists in every installed distribution and
+    picking the wrong one would open a stranger's directory.
     """
     if not view:
         return None
@@ -85,7 +107,24 @@ def reported_cwd(view):
     if not screen:
         return None
     cwd = screen.cwd
-    if cwd and os.path.isdir(cwd):
+    if not cwd:
+        return None
+
+    if sys.platform.startswith("win") and cwd.startswith("/"):
+        # a posix path reported to a terminal running on windows, that is a shell
+        # inside wsl, provided this terminal is the one that launched it
+        cmd = terminal_command(view)
+        if is_wsl_command(cmd):
+            windows_cwd = wsl_to_windows_for_cmd(cwd, cmd)
+            if windows_cwd:
+                cwd = windows_cwd
+            else:
+                # no distribution to translate against, the path stays as it is and
+                # simply does not survive the check below, which is what a terminal
+                # did with it before it could be translated at all
+                logger.debug("no distribution to translate the reported cwd {}".format(cwd))
+
+    if os.path.isdir(cwd):
         return cwd
     return None
 
@@ -1251,6 +1290,47 @@ class TerminusCopyCommandOutputCommand(sublime_plugin.TextCommand):
         # which fills the history for a copy made by the user, and pushing the same
         # text twice is harmless, ClipboardHistory drops its duplicates
         g_clipboard_history.push_text(sublime.get_clipboard())
+
+
+class TerminusOpenShellFolderCommand(sublime_plugin.TextCommand):
+    """
+    Add the directory the shell is in to the window as a folder.
+
+    The directory is the one the shell reported through OSC 7, translated across the
+    wsl boundary and checked for reachability by reported_cwd, so what is opened is
+    always a directory this side of the pty can actually list.
+    """
+
+    def is_enabled(self):
+        return bool(Terminal.from_id(self.view.id()))
+
+    def run(self, _):
+        view = self.view
+        cwd = reported_cwd(view)
+        if not cwd:
+            sublime.status_message(
+                "the shell reported no reachable directory, see SHELL_INTEGRATION.md")
+            return
+
+        # a terminal in a panel is not hosted by the window's view list
+        window = view.window() or get_panel_window(view)
+        if not window:
+            return
+
+        project_data = window.project_data() or {}
+        folders = list(project_data.get("folders", []))
+        target = os.path.normcase(os.path.normpath(cwd))
+        for folder in folders:
+            path = folder.get("path", "") if isinstance(folder, dict) else ""
+            # a relative path in there is relative to the project file, comparing it
+            # against an absolute one simply does not match, which is the safe way round
+            if path and os.path.normcase(os.path.normpath(path)) == target:
+                sublime.status_message("{} is already open".format(cwd))
+                return
+
+        folders.append({"path": cwd})
+        project_data["folders"] = folders
+        window.set_project_data(project_data)
 
 
 class TerminusPasteCommand(sublime_plugin.TextCommand):
