@@ -190,12 +190,24 @@ class TerminalScreen(pyte.Screen):
                 self.scroll_up(line_diff)
                 self.cursor.y -= line_diff
 
-        # if columns < self.columns:
-        #     for line in self.buffer.values():
-        #         for x in range(columns, self.columns):
-        #             line.pop(x, None)
+        if columns < self.columns:
+            # drop the cells beyond the new width, render.py derives the length
+            # of a line from the largest key of the buffer line
+            for line in self.buffer.values():
+                for x in range(columns, self.columns):
+                    line.pop(x, None)
 
         self.lines, self.columns = lines, columns
+
+        # the arithmetic above may leave the cursor outside of the new geometry,
+        # the buffer is a defaultdict so an out of range cursor would materialize
+        # a bogus line and hand it to the renderer
+        self.cursor.y = min(max(self.cursor.y, 0), self.lines - 1)
+        # x is clamped to columns and not to columns - 1, because x == columns is the
+        # pending wrap sentinel draw() parks the cursor on when the right margin is
+        # full; pulling it back onto a live cell would overwrite the last character
+        self.cursor.x = min(max(self.cursor.x, 0), self.columns)
+
         self.set_margins()
         self.tabstops = set(range(8, self.columns, 8))
 
@@ -290,7 +302,11 @@ class TerminalScreen(pyte.Screen):
                     self.buffer[pos[0]][pos[1]] = last._replace(data=normalized)
                     self.dirty.add(pos[0])
             else:
-                break
+                # a char of unknown width, e.g. a variation selector, a zero
+                # width joiner or a zero width space. feed() passes whole runs
+                # of plain text, so the rest of the run must still be drawn.
+                # the char occupies no cell, hence the cursor does not advance
+                continue
 
             if char_width > 0:
                 self.cursor.x = min(self.cursor.x + char_width, self.columns)
@@ -565,6 +581,13 @@ class TerminalScreen(pyte.Screen):
 
 PLAIN_TEXT = "plain_text"
 
+# an OSC sequence which is never terminated must not be able to grow without
+# bound, the code and the parameter are capped and anything beyond is dropped
+MAX_OSC_CODE_LENGTH = 5
+MAX_OSC_PARAM_LENGTH = 4096
+# OSC 1337 of the iTerm2 inline image protocol carries base64 encoded image data
+MAX_OSC_IMAGE_PARAM_LENGTH = 4 * 1024 * 1024
+
 
 class TerminalStream(pyte.Stream):
 
@@ -573,8 +596,8 @@ class TerminalStream(pyte.Stream):
         self.csi["T"] = "scroll_down"
         self.osc = {
             "0": "set_title",
-            "01": "set_icon_name",
-            "02": "set_title",
+            "1": "set_icon_name",
+            "2": "set_title",
             "1337": "handle_iterm_protocol"
         }
         self.yield_what = None
@@ -712,17 +735,45 @@ class TerminalStream(pyte.Stream):
                 elif code == "P":
                     continue  # Set palette. Not implemented.
 
+                # the code may span several characters, e.g. 1337 of the iTerm2
+                # inline image protocol, it ends at the first ";"
                 param = ""
+                in_code = True
+                overflow = False
+                limit = MAX_OSC_PARAM_LENGTH
                 while True:
                     char = yield None
                     if char == ESC:
                         char += yield None
                     if char in OSC_TERMINATORS:
                         break
-                    else:
+                    elif in_code:
+                        if char == ";":
+                            in_code = False
+                            if code == "1337":
+                                limit = MAX_OSC_IMAGE_PARAM_LENGTH
+                        elif len(code) < MAX_OSC_CODE_LENGTH:
+                            code += char
+                        else:
+                            # no code we could ever dispatch, keep consuming the
+                            # sequence but throw it away
+                            in_code = False
+                            overflow = True
+                            limit = 0
+                    elif len(param) < limit:
                         param += char
+                    else:
+                        overflow = True
 
-                osc_dispatch[code](param[1:]) # Drop the ;.
+                if overflow:
+                    logger.debug("oversized osc sequence discarded: {}".format(code))
+                    continue
+
+                if code in osc_dispatch:
+                    osc_dispatch[code](param)
+                else:
+                    # dropping unknown osc codes is the correct failure mode
+                    debug(param)
 
             elif char not in NUL_OR_DEL:
                 draw(char)
