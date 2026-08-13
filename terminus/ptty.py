@@ -166,10 +166,32 @@ class TerminalScreen(pyte.Screen):
     #     pass
 
     def reset(self):
+        if self._alternate_buffer_mode:
+            # a RIS received from inside the alternate buffer has to drop the
+            # alternate buffer state, otherwise push_lines_into_history short
+            # circuits for the rest of the session and a later ESC[?1049l would
+            # restore the stale primary buffer over the live screen
+            self._alternate_buffer_mode = False
+            if "history" in self.primary_buffer:
+                # the alternate buffer's history has maxlen 0 and would silently
+                # swallow every line pushed into it
+                self.history = self.primary_buffer["history"]
+        # the buffer which is live now becomes the primary one, super().reset()
+        # clears it below
+        self.primary_buffer = {}
         super().reset()
         self.cursor = Cursor(0, 0)
         self.history.clear()
         self._reset_callback()
+
+    def clamp_cursor(self):
+        # the buffer is a defaultdict so an out of range cursor would materialize
+        # a bogus line and hand it to the renderer
+        self.cursor.y = min(max(self.cursor.y, 0), self.lines - 1)
+        # x is clamped to columns and not to columns - 1, because x == columns is the
+        # pending wrap sentinel draw() parks the cursor on when the right margin is
+        # full; pulling it back onto a live cell would overwrite the last character
+        self.cursor.x = min(max(self.cursor.x, 0), self.columns)
 
     def resize(self, lines=None, columns=None):
         lines = lines or self.lines
@@ -199,14 +221,8 @@ class TerminalScreen(pyte.Screen):
 
         self.lines, self.columns = lines, columns
 
-        # the arithmetic above may leave the cursor outside of the new geometry,
-        # the buffer is a defaultdict so an out of range cursor would materialize
-        # a bogus line and hand it to the renderer
-        self.cursor.y = min(max(self.cursor.y, 0), self.lines - 1)
-        # x is clamped to columns and not to columns - 1, because x == columns is the
-        # pending wrap sentinel draw() parks the cursor on when the right margin is
-        # full; pulling it back onto a live cell would overwrite the last character
-        self.cursor.x = min(max(self.cursor.x, 0), self.columns)
+        # the arithmetic above may leave the cursor outside of the new geometry
+        self.clamp_cursor()
 
         self.set_margins()
         self.tabstops = set(range(8, self.columns, 8))
@@ -287,13 +303,18 @@ class TerminalScreen(pyte.Screen):
                         (self.cursor.y - 1, self.columns)]:
                     if row < 0:
                         continue
+                    # the base char sits on the previous row once the cursor
+                    # wrapped, it has to be read from the very row it is written
+                    # back to, otherwise it is replaced by the char of the
+                    # current row along with that char's colors
+                    base_line = self.buffer[row]
                     if col >= 2:
-                        last = line[col - 2]
+                        last = base_line[col - 2]
                         if wcswidth(last.data) >= 2:
                             pos = (row, col - 2)
                             break
                     if col >= 1:
-                        last = line[col - 1]
+                        last = base_line[col - 1]
                         pos = (row, col - 1)
                         break
 
@@ -323,8 +344,14 @@ class TerminalScreen(pyte.Screen):
     #     pass
 
     def index(self):
-        if not self.alternate_buffer_mode and self.cursor.y == self.lines - 1:
-            self.push_lines_into_history(1)
+        top, bottom = self.margins or Margins(0, self.lines - 1)
+        # a line only belongs in the scrollback when it scrolls off the top of the
+        # screen, that is when the scrolling region starts at the first line. a
+        # pager which pinned a status line above the region discards its lines
+        # instead of archiving them, otherwise the status line would be copied
+        # into the scrollback on every scroll
+        if not self.alternate_buffer_mode and self.cursor.y == bottom and top == 0:
+            self.push_lines_into_history(1, top)
         super().index()
 
     # def reverse_index(self):
@@ -558,6 +585,18 @@ class TerminalScreen(pyte.Screen):
             self.buffer = self.primary_buffer["buffer"]
             self.history = self.primary_buffer["history"]
             self.cursor = self.primary_buffer["cursor"]
+            # resize() only knows about the buffer which is live, so a stashed
+            # primary buffer still carries the geometry it was saved at. a cursor
+            # from a taller screen would put the prompt on a row which is never
+            # rendered, which looks exactly like the resize killed the terminal
+            self.clamp_cursor()
+            for line in self.buffer.values():
+                # and cells past the right margin would render as an over long
+                # line, render.py derives the length of a line from the largest
+                # key of the buffer line
+                for x in list(line.keys()):
+                    if x >= self.columns:
+                        line.pop(x, None)
 
         self.dirty.update(range(self.lines))
 
@@ -570,13 +609,13 @@ class TerminalScreen(pyte.Screen):
                 break
         return found
 
-    def push_lines_into_history(self, count=None):
+    def push_lines_into_history(self, count=None, start=0):
         if self.alternate_buffer_mode:
             return
         if count is None:
             # find the first non-empty line from the botton
             count = self.first_non_empty_line_from_bottom() + 1
-        self.history.extend(copy(self.buffer[y]) for y in range(count))
+        self.history.extend(copy(self.buffer[y]) for y in range(start, start + count))
 
 
 PLAIN_TEXT = "plain_text"
@@ -587,6 +626,38 @@ MAX_OSC_CODE_LENGTH = 5
 MAX_OSC_PARAM_LENGTH = 4096
 # OSC 1337 of the iTerm2 inline image protocol carries base64 encoded image data
 MAX_OSC_IMAGE_PARAM_LENGTH = 4 * 1024 * 1024
+
+
+def flatten_csi_subparams(subparams):
+    """
+    Map a colon separated CSI parameter of the ITU T.416 form, e.g. the
+    "38:2::255:0:0" truecolor sequence neovim and delta emit, onto the legacy
+    semicolon form select_graphic_rendition understands. The sub parameters are
+    consumed instead of leaking their tail onto the screen as literal text.
+
+    A parameter position always contributes at least one integer, even when it
+    has no legacy equivalent. Contributing nothing would shorten the parameter
+    list, and an SGR with no parameters at all is a full attribute reset in pyte,
+    while a CSI handler with a required argument would raise on the short list.
+    """
+    attr = subparams[0]
+    rest = subparams[1:]
+    if attr in (g.FG_256, g.BG_256):
+        if rest[0] == 5 and len(rest) >= 2:
+            # 38:5:n, the indexed color
+            return [attr, 5, rest[1]]
+        elif rest[0] == 2 and len(rest) >= 4:
+            # 38:2:r:g:b or 38:2:<color space id>:r:g:b, the color space id is
+            # optional and usually empty, hence the rgb triple is taken from the end
+            return [attr, 2] + rest[-3:]
+    elif attr == 4:
+        # the underline styles of "4:x", only the plain underline is supported,
+        # 4:0 turns the underline off
+        return [24] if rest[0] == 0 else [4]
+    # e.g. 58:2:..., the underline color, which has no legacy equivalent. the bare
+    # attribute is kept, select_graphic_rendition does not know it and leaves the
+    # surrounding attributes alone, which is what dropping it should have done
+    return [attr]
 
 
 class TerminalStream(pyte.Stream):
@@ -602,6 +673,20 @@ class TerminalStream(pyte.Stream):
         }
         self.yield_what = None
         super().__init__(*args, **kwargs)
+
+    def restart_parser(self):
+        """
+        Build a fresh parser generator, the way pyte does on attach. The generator is
+        closed for good once a listener raised through it, and feeding a closed
+        generator raises StopIteration, so without this a single bad sequence would
+        leave the terminal blank for the rest of its life.
+        """
+        try:
+            self._parser = self._parser_fsm()
+            self._taking_plain_text = next(self._parser)
+            self.yield_what = self._taking_plain_text
+        except Exception as e:
+            logger.error("cannot restart the parser: {}".format(e))
 
     def _parser_fsm(self):
         """
@@ -698,6 +783,10 @@ class TerminalStream(pyte.Stream):
                 params = []
                 current = ""
                 private = False
+                # a colon separates the sub parameters of a single parameter,
+                # they are collected apart from the plain parameters and folded
+                # into them once the parameter is complete
+                subparams = None
                 while True:
                     char = yield
 
@@ -716,8 +805,18 @@ class TerminalStream(pyte.Stream):
                         break
                     elif char.isdigit():
                         current += char
+                    elif char == ":":
+                        if subparams is None:
+                            subparams = []
+                        subparams.append(min(int(current or 0), 9999))
+                        current = ""
                     else:
-                        params.append(min(int(current or 0), 9999))
+                        if subparams is None:
+                            params.append(min(int(current or 0), 9999))
+                        else:
+                            subparams.append(min(int(current or 0), 9999))
+                            params.extend(flatten_csi_subparams(subparams))
+                            subparams = None
 
                         if char == ";":
                             current = ""
@@ -795,7 +894,15 @@ class TerminalStream(pyte.Stream):
                 else:
                     yield_what = None
             else:
-                yield_what = send(data[offset:offset + 1])
+                try:
+                    yield_what = send(data[offset:offset + 1])
+                except Exception:
+                    # a listener which raises, e.g. a pyte handler reached with the
+                    # parameter list a malformed sequence produced, closes the parser
+                    # generator. rebuild it before the error propagates, otherwise every
+                    # later feed raises StopIteration and only this chunk should be lost
+                    self.restart_parser()
+                    raise
                 offset += 1
 
         self.yield_what = yield_what
