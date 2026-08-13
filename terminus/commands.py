@@ -851,7 +851,14 @@ class TerminusInitializeViewCommand(sublime_plugin.TextCommand):
         view.set_scratch(True)
         view.set_read_only(False)
         view_settings.set("is_widget", True)
-        view_settings.set("gutter", False)
+        # the gutter is where the OSC 133 prompt markers are drawn and the only place
+        # they can be, so it is shown exactly when there is something to draw in it.
+        # without line numbers or fold buttons it stays a narrow strip
+        show_prompt_markers = terminus_settings.get("prompt_markers", True)
+        view_settings.set("gutter", show_prompt_markers)
+        if show_prompt_markers:
+            view_settings.set("line_numbers", False)
+            view_settings.set("fold_buttons", False)
         view_settings.set("highlight_line", False)
         view_settings.set("auto_complete_commit_on_tab", False)
         view_settings.set("draw_centered", False)

@@ -167,11 +167,7 @@ class TerminusGenerateThemeCommand(sublime_plugin.WindowCommand):
         elif theme == "adaptive":
             ui_info = sublime.ui_info()
             palette = ui_info["color_scheme"]["palette"]
-            is_dark_theme = ui_info["theme"]["style"] == "dark"
             gray = "#888888"
-            selection = "#DBDBDB"
-            if is_dark_theme:
-                selection = "#665C54"
             window = sublime.active_window()
             if window:
                 _panel = "terminus_color_scheme"
@@ -188,8 +184,13 @@ class TerminusGenerateThemeCommand(sublime_plugin.WindowCommand):
             variables = {
                 "background": palette["background"],
                 "foreground": palette["foreground"],
-                "selection_foreground": palette["foreground"],
-                "selection": selection,
+                # no "selection" and no "selection_foreground": a hidden color scheme
+                # overrides the variables of the scheme it merges into, and a scheme
+                # which defines its selection as a variable, as most of them do, would
+                # take ours instead of its own. the adaptive theme is supposed to look
+                # like the editor around it, so selecting in a terminal has to look
+                # exactly like selecting anywhere else, down to keeping the colors the
+                # program chose for the text underneath
                 "black": "#000000",
                 "red": palette["redish"],
                 "green": palette["greenish"],
