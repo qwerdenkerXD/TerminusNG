@@ -1,7 +1,8 @@
 import time
 from wcwidth import wcwidth
-from functools import wraps
+from functools import partial, update_wrapper
 from contextlib import contextmanager
+from weakref import WeakKeyDictionary
 import shlex
 
 
@@ -48,23 +49,57 @@ def get_highlight_key(view):
     return "terminus#{}".format(value)
 
 
+class Responsive:
+    """
+    the object `responsive` wraps a function in, see `responsive`
+    """
+
+    def __init__(self, f, period, default):
+        self.f = f
+        self.period = period
+        self.default = default
+        # time of the last real call, a plain function keeps it here
+        self._t = 0
+        # a method keeps one per instance, a single cell shared by all instances would
+        # let whichever instance calls first eat the token and every other instance
+        # would get `default` instead of a real answer. the dictionary is weak so that
+        # a decorated method never keeps its instance alive
+        self._instance_t = WeakKeyDictionary()
+        update_wrapper(self, f)
+
+    def __get__(self, instance, owner=None):
+        if instance is None:
+            return self
+        # bind, the throttle state is looked up per instance in `_call`
+        return partial(self._call, instance)
+
+    def __call__(self, *args, **kwargs):
+        # a plain function, e.g. one decorated inside another function, lands here and
+        # gets the single shared cell, which is what it wants. calling a decorated
+        # method unbound, Terminal.is_hosted(terminal), also lands here and shares that
+        # cell with every other such call, use terminal.is_hosted() instead
+        return self._call(None, *args, **kwargs)
+
+    def _call(self, instance, *args, **kwargs):
+        now = time.time()
+        if instance is None:
+            if now - self._t <= self.period:
+                return self.default
+            self._t = now
+            return self.f(*args, **kwargs)
+        else:
+            if now - self._instance_t.get(instance, 0) <= self.period:
+                return self.default
+            self._instance_t[instance] = now
+            return self.f(instance, *args, **kwargs)
+
+
 def responsive(period=0.1, default=True):
     """
     make a function more responsive
     """
     def wrapper(f):
-        t = [0]
-
-        @wraps(f)
-        def _(*args, **kwargs):
-            now = time.time()
-            if now - t[0] > period:
-                t[0] = now
-                return f(*args, **kwargs)
-            else:
-                return default
-
-        return _
+        return Responsive(f, period, default)
 
     return wrapper
 

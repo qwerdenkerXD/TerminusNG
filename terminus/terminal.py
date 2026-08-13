@@ -29,6 +29,27 @@ logger = logging.getLogger('Terminus')
 # how often a rejected resize to the very same size is retried before it is given up on
 MAX_RESIZE_ATTEMPTS = 5
 
+# how many times in a row a terminal has to be observed to be unhosted before it is
+# reaped, one transient observation, e.g. while a pane is dragged or a layout is being
+# restored, must not kill a live terminal
+MAX_UNHOSTED_OBSERVATIONS = 3
+
+# how often the hosted state is observed, the loops asking for it run at 30 Hz and would
+# otherwise burn through the tolerance above in a hundred milliseconds
+UNHOSTED_OBSERVATION_PERIOD = 1
+
+# how often the view is asked whether it is still valid, that is a call out of the plugin
+# host and the reader asks once per 1024 bytes of child output, not at 30 Hz, so a chatty
+# child would otherwise issue thousands of them a second while holding the lock
+VIEW_GONE_OBSERVATION_PERIOD = 0.1
+
+# strings longer than this are handed to the sending thread instead of being written
+# inline on the calling thread, which may be the UI thread
+MAX_INLINE_WRITE = 512
+
+# how much of a queued string is written to the pty in one go
+WRITE_CHUNK_SIZE = 4096
+
 
 class Terminal:
     _terminals = {}
@@ -52,6 +73,11 @@ class Terminal:
         self._pty_size = None
         self._failed_size = None
         self._resize_failures = 0
+        # consecutive observations of the terminal not being hosted by any window and
+        # the time of the last one, see should_be_reaped
+        self._unhosted_observations = 0
+        self._unhosted_observed_at = 0
+        self._view_checked_at = 0
         self.lock = threading.Lock()
 
     @classmethod
@@ -77,8 +103,10 @@ class Terminal:
     @classmethod
     def cull_terminals(cls):
         terminals_to_kill = []
-        for terminal in cls._terminals.values():
-            if not terminal.is_hosted():
+        # a snapshot, a renderer thread may delete an entry while this runs and a dict
+        # which changes size during iteration raises
+        for terminal in list(cls._terminals.values()):
+            if terminal.should_be_reaped():
                 terminals_to_kill.append(terminal)
 
         for terminal in terminals_to_kill:
@@ -112,12 +140,68 @@ class Terminal:
                 del Terminal._terminals[self.view.id()]
             self.view = None
 
-    @responsive(period=1, default=True)
-    def is_hosted(self):
+    def _is_hosted(self):
         if self.detached:
             # irrelevant if terminal is detached
             return True
         return self.window is not None
+
+    # the throttled public predicate, kept for callers outside the reaping path. do not
+    # use it in should_be_reaped, it answers the hardcoded default in between real calls
+    @responsive(period=1, default=True)
+    def is_hosted(self):
+        return self._is_hosted()
+
+    def view_is_gone(self):
+        # a closed view and a destroyed output panel never come back, unlike the window
+        # lookup of _is_hosted which reports false transiently
+        if self.detached:
+            return False
+        view = self.view
+        if not view:
+            return False
+        return not view.is_valid()
+
+    def should_be_reaped(self):
+        """
+        whether the terminal lost its host for good and its process has to be terminated
+
+        a view which is gone is reaped right away, that is the deterministic teardown of
+        a panel terminal, which never gets an on_pre_close. a view which is merely not
+        hosted by any window has to be observed as such a few times in a row, and the
+        observations are rate limited because the callers poll far faster than the window
+        layout settles. note that is_hosted cannot be used here, it is throttled and
+        answers the hardcoded default in between, which would reset the counter below
+        """
+        if self.detached:
+            self._unhosted_observations = 0
+            return False
+
+        now = time.time()
+
+        if now - self._view_checked_at > VIEW_GONE_OBSERVATION_PERIOD:
+            self._view_checked_at = now
+            if self.view_is_gone():
+                return True
+
+        if now - self._unhosted_observed_at <= UNHOSTED_OBSERVATION_PERIOD:
+            # not an observation, the previous verdict stands
+            return False
+        self._unhosted_observed_at = now
+
+        if self._is_hosted():
+            self._unhosted_observations = 0
+            return False
+
+        # read, add and store locally, three threads share the counter and only ever
+        # increase it while the terminal stays unhosted, so a lost increment costs
+        # another observation period but can never keep the count from reaching the
+        # tolerance, and can never kill a hosted terminal early
+        observations = self._unhosted_observations + 1
+        self._unhosted_observations = observations
+        logger.debug(
+            "terminal is unhosted (%s/%s)", observations, MAX_UNHOSTED_OBSERVATIONS)
+        return observations >= MAX_UNHOSTED_OBSERVATIONS
 
     def can_be_resized(self):
         # an unmeasurable viewport, e.g. during a pane drag, a layout change or when the
@@ -178,7 +262,7 @@ class Terminal:
                 with self.lock:
                     data[0] += temp
 
-                    if done[0] or not self.is_hosted():
+                    if done[0] or self.should_be_reaped():
                         logger.debug("reader breaks")
                         break
 
@@ -216,7 +300,7 @@ class Terminal:
                         except Exception as e:
                             logger.error("error rendering: %s", e)
 
-                    if done[0] or not self.is_hosted():
+                    if done[0] or self.should_be_reaped():
                         logger.debug("renderer breaks")
                         break
 
@@ -224,8 +308,15 @@ class Terminal:
             done[0] = True
 
             def _cleanup():
-                if self.view:
-                    self.view.run_command("terminus_cleanup")
+                view = self.view
+                if not view:
+                    return
+                if view.is_valid():
+                    view.run_command("terminus_cleanup")
+                else:
+                    # the view is gone, terminus_cleanup cannot run on it and the
+                    # process would be left running forever
+                    self.kill()
 
             sublime.set_timeout(_cleanup)
 
@@ -370,12 +461,12 @@ class Terminal:
                 string = string.replace("\n", "\r")
 
         no_queue = not self._pending_to_send_string[0]
-        if no_queue and len(string) <= 512:
+        if no_queue and len(string) <= MAX_INLINE_WRITE:
             logger.debug("sent: {}".format(string[0:64] if len(string) > 64 else string))
             self.process.write(string)
         else:
-            for i in range(0, len(string), 512):
-                self._strings.put(string[i:i+512])
+            for i in range(0, len(string), WRITE_CHUNK_SIZE):
+                self._strings.put(string[i:i+WRITE_CHUNK_SIZE])
             if no_queue:
                 self._pending_to_send_string[0] = True
                 threading.Thread(target=self.process_send_string).start()
@@ -384,13 +475,31 @@ class Terminal:
         while True:
             try:
                 string = self._strings.get(False)
-                logger.debug("sent: {}".format(string[0:64] if len(string) > 64 else string))
-                self.process.write(string)
             except Empty:
                 self._pending_to_send_string[0] = False
                 return
-            else:
-                time.sleep(0.1)
+
+            logger.debug("sent: {}".format(string[0:64] if len(string) > 64 else string))
+            try:
+                # the write blocks until the pty has taken the data, that is the
+                # backpressure. a fixed sleep per chunk would cap a paste at a few
+                # kilobytes per second no matter how fast the child reads
+                self.process.write(string)
+            except Exception as e:
+                logger.error("error sending string: {}".format(e))
+                # nothing queued can be delivered any more, drop it, otherwise the
+                # pending flag would stay set and every later string would be queued
+                # behind it without anyone draining the queue
+                self.drop_pending_strings()
+                return
+
+    def drop_pending_strings(self):
+        while True:
+            try:
+                self._strings.get(False)
+            except Empty:
+                break
+        self._pending_to_send_string[0] = False
 
     def bracketed_paste_mode_enabled(self):
         return (2004 << 5) in self.screen.mode
@@ -410,9 +519,15 @@ class Terminal:
         return None
 
     def show_image(self, data, args, cr=None):
-        view = self.view
-
         if "inline" not in args or not args["inline"]:
+            return
+
+        view = self.view
+        if self.detached or not view:
+            # the renderer feeds the stream before it checks for detached and a reset,
+            # a maximize or a minimize leaves the view unset over a couple of event loop
+            # hops, an image arriving in that window has nowhere to go
+            logger.debug("no view to show the image in")
             return
 
         cursor = self.screen.cursor
@@ -427,8 +542,10 @@ class Terminal:
 
         what, width, height = image_info
 
-        _, image_path = tempfile.mkstemp(suffix="." + what)
-        with open(image_path, "wb") as f:
+        # the descriptor of mkstemp has to be closed, on windows an open handle makes
+        # os.remove fail and the temporary file would be left behind for good
+        fd, image_path = tempfile.mkstemp(suffix="." + what)
+        with os.fdopen(fd, "wb") as f:
             f.write(databytes)
 
         width, height = image_resize(

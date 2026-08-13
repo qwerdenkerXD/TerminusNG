@@ -14,6 +14,21 @@ logger = logging.getLogger('Terminus')
 
 class TerminusCoreEventListener(sublime_plugin.EventListener):
 
+    def __init__(self):
+        super().__init__()
+        # sublime instantiates one listener for the whole application, the last known
+        # cursor position hence has to be tracked per view instead of per listener
+        self._cursors = {}
+
+    def _evict_cursors(self):
+        # forget the views which no longer host a terminal, otherwise the dict would
+        # grow for the whole session. this runs on the async thread while on_pre_close
+        # removes entries on the main thread, hence the pop instead of a del, the key
+        # may be gone by the time it is reached
+        for vid in list(self._cursors.keys()):
+            if not Terminal._terminals.get(vid):
+                self._cursors.pop(vid, None)
+
     def on_activated_async(self, view):
         recency_manager = RecencyManager.from_view(view)
         if not recency_manager:
@@ -26,6 +41,8 @@ class TerminusCoreEventListener(sublime_plugin.EventListener):
         if random() > 0.7:
             # occassionally cull zombie terminals
             Terminal.cull_terminals()
+            # and the cursors of the views they were hosted in
+            self._evict_cursors()
             # clear undo stack
             view.run_command("terminus_clear_undo_stack")
 
@@ -57,6 +74,7 @@ class TerminusCoreEventListener(sublime_plugin.EventListener):
         terminal = Terminal.from_id(view.id())
         if terminal:
             terminal.kill()
+        self._cursors.pop(view.id(), None)
 
     def on_modified(self, view):
         # to catch unicode input
@@ -70,10 +88,13 @@ class TerminusCoreEventListener(sublime_plugin.EventListener):
                 len(view.sel()) == 1 and view.sel()[0].empty():
             chars = args["characters"]
             current_cursor = view.sel()[0].end()
+            # 0 if the cursor of this view has not been seen yet, the region is then
+            # just the inserted characters
             region = sublime.Region(
-                max(current_cursor - len(chars), self._cursor), current_cursor)
+                max(current_cursor - len(chars), self._cursors.get(view.id(), 0)),
+                current_cursor)
             text = view.substr(region)
-            self._cursor = current_cursor
+            self._cursors[view.id()] = current_cursor
             logger.debug("text {} detected".format(text))
             view.run_command("terminus_paste_text", {"text": text, "bracketed": False})
         elif command:
@@ -86,7 +107,7 @@ class TerminusCoreEventListener(sublime_plugin.EventListener):
             return
         if len(view.sel()) != 1 or not view.sel()[0].empty():
             return
-        self._cursor = view.sel()[0].end()
+        self._cursors[view.id()] = view.sel()[0].end()
 
     def on_text_command(self, view, name, args):
         if not view.settings().get('terminus_view'):

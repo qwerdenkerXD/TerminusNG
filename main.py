@@ -8,7 +8,12 @@ prefix = __package__ + "."  # don't clear the base package
 for module_name in [
     module_name
     for module_name in sys.modules
-    if module_name.startswith(prefix) and module_name != __name__
+    # subpackages and their contents, but never a top level sibling module such as
+    # backend_info, which sublime scans and reloads by itself, pulling that one out of
+    # sys.modules here would leave sublime holding a module it can no longer reload
+    if module_name.startswith(prefix) and module_name != __name__ and
+    ("." in module_name[len(prefix):] or
+     hasattr(sys.modules[module_name], "__path__"))
 ]:
     del sys.modules[module_name]
 del prefix
@@ -51,6 +56,7 @@ from .terminus.render import (  # noqa: E402
     TerminusRenderCommand,
     TerminusShowCursorCommand
 )
+from .terminus.terminal import Terminal  # noqa: E402
 from .terminus.theme import (  # noqa: E402
     TerminusGenerateThemeCommand,
     TerminusSelectThemeCommand,
@@ -130,6 +136,15 @@ def plugin_unloaded():
     # close all terminals
     for w in sublime.windows():
         w.run_command("terminus_close_all")
+
+    # a detached terminal, e.g. one which is being maximized or minimized while the
+    # package is reloaded, is hosted by no view and is missed by the loop above
+    for terminal in list(Terminal._detached_terminals):
+        try:
+            terminal.kill()
+        except Exception as e:
+            logger.error("error killing detached terminal: {}".format(e))
+    Terminal._detached_terminals.clear()
 
     theme_plugin_unloaded()
     settings = sublime.load_settings("Terminus.sublime-settings")
