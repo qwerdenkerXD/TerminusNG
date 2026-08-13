@@ -134,6 +134,12 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
 
         if terminal._pending_to_clear_scrollback[0]:
             view.replace(edit, sublime.Region(0, view.size()), "")  # nuke everything
+            # the text is gone, so all the color regions are empty now, drop them and
+            # rewind the highlight counter, otherwise the next `get_highlight_key` has
+            # to descend the whole counter one step at a time
+            for line in list(self.colored_lines.keys()):
+                self.decolorize_line(line)
+            view.settings().set("terminus.highlight_counter", 0)
             terminal.offset = 0
             terminal.clean_images()
             terminal._pending_to_clear_scrollback[0] = False
@@ -221,6 +227,11 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
             self.ensure_position(edit, line, segments[-1][2])
             if line not in self.colored_lines:
                 self.colored_lines[line] = []
+        # segments of a line sharing the same scope are batched together, so that they
+        # take one `add_regions` call instead of one call each. the batches are kept
+        # within a line, hence a key never spans two lines and `decolorize_line` and
+        # `trim_history` keep working on a per line basis
+        regions_of_scope = {}
         for s in segments:
             fg, bg, bold = s[3:]
             if not is_supported_color(fg):
@@ -235,12 +246,15 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
                         bg = "light_" + bg
                 a = view.text_point(line, s[1])
                 b = view.text_point(line, s[2])
-                key = get_highlight_key(view)
-                view.add_regions(
-                    key,
-                    [sublime.Region(a, b)],
-                    "terminus.{}.{}".format(fg, bg))
-                self.colored_lines[line].append(key)
+                scope = "terminus.{}.{}".format(fg, bg)
+                if scope not in regions_of_scope:
+                    regions_of_scope[scope] = []
+                regions_of_scope[scope].append(sublime.Region(a, b))
+
+        for scope, regions in regions_of_scope.items():
+            key = get_highlight_key(view)
+            view.add_regions(key, regions, scope)
+            self.colored_lines[line].append(key)
 
     def decolorize_line(self, line):
         if line in self.colored_lines:
