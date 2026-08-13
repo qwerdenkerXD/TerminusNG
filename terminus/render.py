@@ -10,7 +10,7 @@ from wcwidth import wcswidth
 
 
 from .const import CONTINUATION
-from .ptty import XTERM_256_COLORS
+from .ptty import XTERM_256_COLORS, line_marks
 from .terminal import Terminal
 from .utils import rev_wcwidth, get_highlight_key
 
@@ -140,6 +140,8 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
             for line in list(self.colored_lines.keys()):
                 self.decolorize_line(line)
             view.settings().set("terminus.highlight_counter", 0)
+            # the rows the marks name are gone with the text
+            terminal.marks.clear()
             terminal.offset = 0
             terminal.clean_images()
             terminal._pending_to_clear_scrollback[0] = False
@@ -192,14 +194,31 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
             for line in range(len(history)):
                 buffer_line = history.pop()
                 lf = buffer_line[columns - 1].linefeed
-                self.update_line(edit, offset - line - 1, buffer_line, lf)
+                row = offset - line - 1
+                self.update_line(edit, row, buffer_line, lf)
+                self.remark_line(terminal, row, buffer_line)
 
             # update dirty line¡s
             logger.debug("screen is dirty: {}".format(str(dirty_lines)))
             for line in dirty_lines:
                 buffer_line = screen.buffer[line]
                 lf = buffer_line[columns - 1].linefeed
-                self.update_line(edit, line + offset, buffer_line, lf)
+                row = line + offset
+                self.update_line(edit, row, buffer_line, lf)
+                self.remark_line(terminal, row, buffer_line)
+
+    def remark_line(self, terminal, line, buffer_line):
+        """
+        mirror the OSC 133 marks of a buffer line onto the view row it was just
+        written to, that write is the only place a mark becomes a row
+        """
+        marks = line_marks(buffer_line)
+        if marks:
+            terminal.marks[line] = marks
+        else:
+            # whatever line occupies the row now carries no mark, so the row does
+            # not either, an entry left behind would name text which is gone
+            terminal.marks.pop(line, None)
 
     def update_line(self, edit, line, buffer_line, lf):
         view = self.view
@@ -276,6 +295,10 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
                     (row not in self.colored_lines or len(self.colored_lines[row]) == 0):
                 region = view.line(view.text_point(row, 0))
                 view.erase(edit, sublime.Region(region.begin() - 1, region.end()))
+                # the row goes, so the mark on it goes too. a mark never keeps text
+                # alive, it only ever follows it. the buffer line still carries it
+                # and the next write of that row brings it back
+                terminal.marks.pop(row, None)
                 row = row - 1
             else:
                 break
@@ -304,6 +327,10 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
                 self.decolorize_line(line)
             # shift colored_lines indexes
             self.colored_lines = {k - m: v for (k, v) in self.colored_lines.items()}
+            # the marks of the rows which are about to go are dropped outright, a
+            # clamped one would be a phantom prompt sitting on row 0 forever. the
+            # rest shifts with the text, the same way colored_lines does above
+            terminal.marks = {k - m: v for (k, v) in terminal.marks.items() if k >= m}
             top_region = sublime.Region(0, view.line(view.text_point(m - 1, 0)).end() + 1)
             view.erase(edit, top_region)
             terminal.offset -= m
@@ -318,7 +345,9 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
                 view.size()
             )
             for line in view.lines(tail_region):
-                self.decolorize_line(view.rowcol(line.begin())[0])
+                row = view.rowcol(line.begin())[0]
+                self.decolorize_line(row)
+                terminal.marks.pop(row, None)
             view.erase(edit, tail_region)
 
 

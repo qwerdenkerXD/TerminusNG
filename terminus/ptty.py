@@ -103,6 +103,40 @@ def uri_to_path(uri):
     return None
 
 
+MARK_PROMPT = "A"    # a fresh line, the prompt begins
+MARK_INPUT = "B"     # the prompt ends, the user input begins
+MARK_OUTPUT = "C"    # the user input ends, the command output begins
+MARK_END = "D"       # the command finished, exit_code may be None
+MARK_KINDS = (MARK_PROMPT, MARK_INPUT, MARK_OUTPUT, MARK_END)
+# the shared empty result of line_marks, it is never mutated
+EMPTY_MARKS = ()
+
+
+def line_marks(buffer_line):
+    """
+    the OSC 133 marks a buffer line carries, this is the one place the attribute
+    is read. the result is a tuple and must be treated as immutable, a line in the
+    scrollback may be sharing it with the line it was copied from
+    """
+    return getattr(buffer_line, "semantic_marks", EMPTY_MARKS)
+
+
+class SemanticMark(object):
+    """
+    one OSC 133 boundary the shell reported, it belongs to a buffer line and not to
+    a view row, render.py turns it into a row when it writes that line out
+    """
+    __slots__ = ("kind", "exit_code")
+
+    def __init__(self, kind, exit_code=None):
+        self.kind = kind
+        self.exit_code = exit_code
+
+    def __repr__(self):
+        return "SemanticMark({}{})".format(
+            self.kind, "" if self.exit_code is None else ", " + str(self.exit_code))
+
+
 FILE_PARAM_PATTERN = re.compile(
     r"^File=(?P<arguments>[^:]*?):(?P<data>[a-zA-Z0-9\+/=]*)(?P<cr>\r?)$"
 )
@@ -446,6 +480,9 @@ class TerminalScreen(pyte.Screen):
         self.dirty.update(interval)
         for y in interval:
             line = self.buffer[y]
+            # the cells are blanked in place, so the line object survives and would
+            # keep carrying the marks of the text which was just erased
+            self.drop_marks(y)
             for i, x in list(enumerate(line)):
                 if i < self.columns:
                     line[x] = self.cursor.attrs
@@ -453,6 +490,10 @@ class TerminalScreen(pyte.Screen):
                     line.pop(x, None)
 
         if how == 0 or how == 1:
+            # the marks of the cursor line are deliberately kept, even when all of
+            # it is blanked. a prompt redrawn in place is CR, some sgr, then an
+            # erase, and the shell does not report its boundaries a second time,
+            # zle and fish repaint that way on every keystroke
             self.erase_in_line(how)
 
         if how == 3:
@@ -571,6 +612,9 @@ class TerminalScreen(pyte.Screen):
         top, bottom = self.margins or Margins(0, self.lines - 1)
         for y in range(top, bottom + 1):
             if y + n > bottom:
+                # clear() empties the cells but keeps the instance attributes, the
+                # marks of the line which just scrolled away have to go by hand
+                self.drop_marks(y)
                 self.buffer[y].clear()
             else:
                 self.buffer[y] = copy(self.buffer[y + n])
@@ -580,10 +624,72 @@ class TerminalScreen(pyte.Screen):
         top, bottom = self.margins or Margins(0, self.lines - 1)
         for y in reversed(range(top, bottom + 1)):
             if y - n < top:
+                self.drop_marks(y)
                 self.buffer[y].clear()
             else:
                 self.buffer[y] = copy(self.buffer[y - n])
         self.dirty.update(range(self.lines))
+
+    def attach_mark(self, kind, exit_code=None):
+        """
+        put an OSC 133 mark on the line the cursor is on, a second mark of the same
+        kind replaces the first one, which is what a prompt redrawn in place does
+        """
+        line = self.buffer[self.cursor.y]
+        mark = SemanticMark(kind, exit_code)
+        marks = list(line_marks(line))
+        for i, m in enumerate(marks):
+            if m.kind == kind:
+                marks[i] = mark
+                break
+        else:
+            marks.append(mark)
+        # the tuple is rebound and never mutated in place, a copy of this line in the
+        # scrollback shares the very same tuple object with it
+        line.semantic_marks = tuple(marks)
+        # the row has to be written out again for the mark to reach the view
+        self.dirty.add(self.cursor.y)
+
+    def drop_marks(self, y):
+        """
+        forget the marks of a line which is about to be blanked in place
+        """
+        # the buffer is a defaultdict, get() keeps a row which does not exist yet
+        # from being materialized and handed to the renderer
+        line = self.buffer.get(y)
+        if line is not None and hasattr(line, "semantic_marks"):
+            del line.semantic_marks
+
+    def set_semantic_mark(self, param):
+        # OSC 133 reports the prompt and command boundaries of the shell, e.g.
+        # ESC]133;A ESC\ in front of the prompt and ESC]133;D;0 ESC\ once the
+        # command finished, see SHELL_INTEGRATION.md
+        if self.alternate_buffer_mode:
+            # a full screen application draws over the prompt, nothing it emits
+            # describes the boundaries of the shell
+            return
+        fields = param.split(";")
+        kind = fields[0].strip()
+        if kind in (MARK_PROMPT, MARK_INPUT, MARK_OUTPUT):
+            self.attach_mark(kind)
+        elif kind == MARK_END:
+            # a D with no status, an empty one or one which is not a plain decimal
+            # number still marks a command which finished, only its status is
+            # unknown. int() alone would take "1_0", "+9", non ascii digits and an
+            # integer of any size from anything which can write to the pty, and a
+            # consumer would then format or compare that, so the digits are checked
+            # first. five of them is far more than a status can be worth
+            status = fields[1].strip() if len(fields) > 1 else ""
+            digits = status[1:] if status[:1] == "-" else status
+            if digits.isdigit() and digits.isascii() and len(digits) <= 5:
+                exit_code = int(status)
+            else:
+                exit_code = None
+            self.attach_mark(MARK_END, exit_code)
+        else:
+            # P carries semantic properties and anything else is a subcommand of a
+            # newer shell, both are consumed and dropped
+            logger.debug("ignoring osc 133 subcommand: {}".format(param))
 
     def set_cwd(self, param):
         # OSC 7 reports the working directory as a file uri every time it changes,
@@ -716,6 +822,10 @@ class TerminalStream(pyte.Stream):
             "1": "set_icon_name",
             "2": "set_title",
             "7": "set_cwd",
+            # the dispatch table is captured by value when the parser generator is
+            # built in super().__init__(), an entry added afterwards is never
+            # dispatched, so every osc code belongs in this literal
+            "133": "set_semantic_mark",
             "1337": "handle_iterm_protocol"
         }
         self.yield_what = None

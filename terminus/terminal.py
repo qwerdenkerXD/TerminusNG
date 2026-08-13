@@ -63,6 +63,10 @@ class Terminal:
         self._cached_cursor_is_hidden = [True]
         self.image_count = 0
         self.images = {}
+        # the OSC 133 boundaries the shell reported, view row -> tuple of SemanticMark.
+        # they live here and not in view regions because a maximize or a minimize
+        # hands the terminal a brand new view with the very same rows
+        self.marks = {}
         # whether the child process runs under TERM=linux, see the unix_term setting
         self.linux_mode = False
         self._strings = Queue()
@@ -326,6 +330,11 @@ class Terminal:
         if offset is not None:
             self.offset = offset
         else:
+            # the offset is being re derived from a view this terminal did not write,
+            # a reset or a reused view, so every row a mark names belongs to text
+            # which is gone. a maximize or a minimize passes an explicit offset and
+            # keeps its marks, the rows are preserved there
+            self.marks = {}
             if self.view and self.view.size() > 0:
                 view = self.view
                 self.offset = view.rowcol(view.size())[0] + 1
