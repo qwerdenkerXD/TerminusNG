@@ -54,6 +54,23 @@
         "command": "terminus_minimize"
     },
     {
+        "caption": "Terminus: Jump to Previous Prompt",
+        "command": "terminus_jump_to_prompt"
+    },
+    {
+        "caption": "Terminus: Jump to Next Prompt",
+        "command": "terminus_jump_to_prompt",
+        "args": {"forward": true}
+    },
+    {
+        "caption": "Terminus: Select Command Output",
+        "command": "terminus_select_command_output"
+    },
+    {
+        "caption": "Terminus: Copy Command Output",
+        "command": "terminus_copy_command_output"
+    },
+    {
         "caption": "Terminus Utilities: Select Theme",
         "command": "terminus_select_theme"
     },

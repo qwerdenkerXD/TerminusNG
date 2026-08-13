@@ -9,6 +9,7 @@ import logging
 from .clipboard import g_clipboard_history
 from .const import DEFAULT_PANEL, DEFAULT_TITLE, EXEC_PANEL, CONTINUATION
 from .key import get_key_code
+from .ptty import MARK_END, MARK_INPUT, MARK_OUTPUT, MARK_PROMPT
 from .recency import RecencyManager
 from .terminal import Terminal
 from .utils import available_panel_name
@@ -143,6 +144,177 @@ def unoccupied_panel_name(window, panel_name, terminal):
         return panel_name
 
     return available_panel_name(window, panel_name)
+
+
+def semantic_marks(view):
+    """
+    The OSC 133 boundaries a terminal view's shell reported, as (row, kind, exit_code)
+    in view row order. Rows are view rows, the coordinate every other command here uses.
+    """
+    if not view:
+        return []
+    terminal = Terminal.from_id(view.id())
+    if not terminal:
+        return []
+    # a shell which does not report its prompt never puts anything in here, and a
+    # terminal which was just reset had its marks dropped with the text
+    marks = terminal.marks
+    if not marks:
+        return []
+    try:
+        # the renderer thread writes the marks while this reads them on the ui thread,
+        # a snapshot taken in one go is what a dict which may change size under us
+        # allows, see cull_terminals
+        rows = sorted(marks.items(), key=lambda item: item[0])
+    except RuntimeError:
+        logger.debug("the marks changed while they were read")
+        return []
+    reported = []
+    for row, row_marks in rows:
+        for mark in row_marks:
+            reported.append((row, mark.kind, mark.exit_code))
+    return reported
+
+
+def prompt_rows(marks):
+    """
+    the rows a jump stops at, that is the rows where a prompt begins. a shell which
+    reports only the end of its prompt and no beginning is followed on that instead
+    """
+    rows = [row for (row, kind, _) in marks if kind == MARK_PROMPT]
+    if not rows:
+        rows = [row for (row, kind, _) in marks if kind == MARK_INPUT]
+    # a prompt redrawn in place is marked again on the same row, and a one line
+    # prompt carries its beginning and its end together, either way it is one stop
+    return sorted(set(rows))
+
+
+def command_output_rows(view, row):
+    """
+    The first and the last view row of the output of the command around a view row,
+    or None when there is no such output.
+
+    The output of a block begins at the output mark inside it and ends right before
+    the mark which closed the command. Two things about where those marks land are
+    what the arithmetic below is built on, and both were read off real bash and zsh
+    sessions rather than assumed:
+
+      * the output mark of a block always sits *strictly below* the row its prompt
+        begins on. the shell only reports it once the user pressed enter, and the
+        terminal has echoed the newline by then.
+      * a command which printed nothing puts its output mark and the mark which
+        closed it on the very row the next prompt is drawn on, so a block whose
+        output would begin at or after its closing mark printed nothing at all.
+
+    A prompt under which nothing was run, which is what the live prompt at the
+    bottom is, hands over to the command before it, so that asking at the prompt
+    means "the command I just ran".
+    """
+    marks = semantic_marks(view)
+    if not marks:
+        return None
+
+    output_rows = [r for (r, kind, _) in marks if kind == MARK_OUTPUT]
+    if not output_rows:
+        return None
+    end_rows = [r for (r, kind, _) in marks if kind == MARK_END]
+    prompts = prompt_rows(marks)
+
+    begin = None
+    start = next((p for p in reversed(prompts) if p <= row), None)
+    if start is not None:
+        limit = next((p for p in prompts if p > start), None)
+        # strictly below the prompt row, an output mark sitting on it belongs to the
+        # command before it, and up to and including the next prompt row, which is
+        # where a command that printed nothing puts it
+        begin = next((r for r in output_rows
+                      if r > start and (limit is None or r <= limit)), None)
+    if begin is None:
+        # nothing ran under this prompt, or the shell reports no prompt at all, so
+        # the output mark at or above the row is the best the marks allow
+        begin = next((r for r in reversed(output_rows) if r <= row), None)
+    if begin is None:
+        return None
+
+    closed = next((r for r in end_rows if r >= begin), None)
+    lastrow = view.rowcol(view.size())[0]
+    if closed is None:
+        # the command has not finished, its output reaches the end of the view
+        end = lastrow
+    else:
+        end = min(closed - 1, lastrow)
+    if begin > end:
+        # the command printed nothing, or its rows were trimmed away
+        return None
+    return (begin, end)
+
+
+def command_output_region(view, row):
+    """the region the output of the command around a view row occupies, or None"""
+    rows = command_output_rows(view, row)
+    if rows is None:
+        return None
+    begin, end = rows
+    return sublime.Region(
+        view.text_point(begin, 0), view.line(view.text_point(end, 0)).end())
+
+
+def visible_rows(view):
+    """the first and the last view row the viewport shows, both inclusive"""
+    region = view.visible_region()
+    return (view.rowcol(region.begin())[0], view.rowcol(region.end())[0])
+
+
+def cursor_row(view):
+    """the view row the terminal cursor sits on, None if there is no live screen"""
+    terminal = Terminal.from_id(view.id())
+    screen = getattr(terminal, "screen", None) if terminal else None
+    if not screen:
+        return None
+    return terminal.offset + screen.cursor.y
+
+
+def reference_row(view):
+    """
+    the row the semantic commands work from, that is the terminal cursor while it is
+    on screen and the first visible row once the user has scrolled or jumped away from
+    it. the caret cannot be used to remember where the user is looking, focus_cursor
+    puts it back onto the terminal cursor on essentially every render
+    """
+    top, bottom = visible_rows(view)
+    row = cursor_row(view)
+    if row is not None and top <= row <= bottom:
+        return row
+    return top
+
+
+def jump_reference_row(view, rows):
+    """
+    the row a jump counts from, given the rows it may stop at.
+
+    it cannot be the terminal cursor: a jump only scrolls, so on a tall enough view
+    the cursor stays visible and every further jump would recompute the very same
+    target and the user would never get past the first prompt. it is the row the last
+    jump landed on while that row is still on screen and is still a prompt, and the
+    top of the viewport otherwise, so that a scroll by hand or a scrollback trim
+    moving the rows underneath simply starts the walk again from what is on screen
+    """
+    top, bottom = visible_rows(view)
+    row = view.settings().get("terminus_view.jump_row", None)
+    if row is not None and top <= row <= bottom and row in rows:
+        return row
+    return top
+
+
+def scroll_to_row(view, row):
+    """
+    put a view row at the top of the viewport without touching the selection. the y
+    which render.py keeps in terminus_view.viewport_y is deliberately left alone, it
+    is what tells the renderer that the user is no longer at the bottom of the output
+    and that it must not scroll the view back down
+    """
+    y = view.text_to_layout(view.text_point(row, 0))[1]
+    view.set_viewport_position((0, y), False)
 
 
 class TerminusOpenCommand(sublime_plugin.WindowCommand):
@@ -613,6 +785,7 @@ class TerminusInitializeViewCommand(sublime_plugin.TextCommand):
             view.run_command("terminus_nuke")
             view.settings().erase("terminus_view.finished")
             view.settings().erase("terminus_view.viewport_y")
+            view.settings().erase("terminus_view.jump_row")
 
         view_settings.set("terminus_view", True)
         view_settings.set("terminus_view.args", kwargs)
@@ -731,6 +904,7 @@ class TerminusResetCommand(sublime_plugin.TextCommand):
         if soft:
             view.run_command("terminus_nuke")
             view.settings().erase("terminus_view.viewport_y")
+            view.settings().erase("terminus_view.jump_row")
             terminal.set_offset()
             return
 
@@ -975,6 +1149,108 @@ class TerminusCopyCommand(sublime_plugin.TextCommand):
         text = text.replace(CONTINUATION, "")
 
         sublime.set_clipboard(text)
+
+
+class TerminusJumpToPromptCommand(sublime_plugin.TextCommand):
+    """
+    Scroll to the prompt before or after the row the view is looking at. The caret is
+    deliberately left where it is, focus_cursor clears the selection and puts the caret
+    back onto the terminal cursor on essentially every render, so a caret which was
+    moved here would be moved back before the user ever saw it.
+    """
+
+    def is_enabled(self, forward=False):
+        return bool(Terminal.from_id(self.view.id()))
+
+    def run(self, _, forward=False):
+        view = self.view
+        rows = prompt_rows(semantic_marks(view))
+        if not rows:
+            sublime.status_message(
+                "the shell reported no prompt, see SHELL_INTEGRATION.md")
+            return
+
+        row = jump_reference_row(view, rows)
+        if forward:
+            target = next((r for r in rows if r > row), None)
+        else:
+            target = next((r for r in reversed(rows) if r < row), None)
+
+        if target is None:
+            sublime.status_message(
+                "no {} prompt".format("next" if forward else "previous"))
+            return
+
+        scroll_to_row(view, target)
+        # where the next jump counts from, the viewport cannot be read back reliably
+        # in the same tick it was set in
+        view.settings().set("terminus_view.jump_row", target)
+
+
+class TerminusSelectCommandOutputCommand(sublime_plugin.TextCommand):
+    """
+    Select the output of the command around the cursor.
+
+    The selection survives while the view is scrolled away from the bottom, which is
+    where this command is used: render.py only runs terminus_show_cursor, and with it
+    focus_cursor, when the viewport is following the terminal cursor. At the bottom
+    the first render after this drops the selection again, so
+    terminus_copy_command_output is the one to use to actually get the text out.
+    """
+
+    def is_enabled(self):
+        return bool(Terminal.from_id(self.view.id()))
+
+    def run(self, _):
+        view = self.view
+        # a region is compared against None, an empty one, that is a command whose
+        # output is a single blank row, is falsy
+        region = command_output_region(view, reference_row(view))
+        if region is None:
+            sublime.status_message("no command output around the cursor")
+            return
+
+        sel = view.sel()
+        sel.clear()
+        sel.add(region)
+
+
+class TerminusCopyCommandOutputCommand(sublime_plugin.TextCommand):
+    """
+    Copy the output of the command around the cursor to the clipboard.
+    """
+
+    def is_enabled(self):
+        return bool(Terminal.from_id(self.view.id()))
+
+    def run(self, _):
+        view = self.view
+        # a region is compared against None, an empty one, that is a command whose
+        # output is a single blank row, is falsy
+        region = command_output_region(view, reference_row(view))
+        if region is None:
+            sublime.status_message("no command output around the cursor")
+            return
+
+        # the text is read straight out of the region rather than selected and handed
+        # to terminus_copy. a selection made here does not survive: focus_cursor
+        # clears it and puts the caret back on the terminal cursor on the very next
+        # render, and one byte of output from a background job is enough to trigger
+        # one between the two commands
+        text = view.substr(region)
+        # remove the continuation marker, the same way terminus_copy does
+        text = text.replace(CONTINUATION + "\n", "")
+        text = text.replace(CONTINUATION, "")
+        if not text.strip():
+            # a command which is still running and has not printed anything yet, do
+            # not wipe whatever the user has on the clipboard for that
+            sublime.status_message("no command output around the cursor")
+            return
+        sublime.set_clipboard(text)
+        # a command run from here does not necessarily reach the on_post_text_command
+        # which fills the history for a copy made by the user, and pushing the same
+        # text twice is harmless, ClipboardHistory drops its duplicates
+        g_clipboard_history.push_text(sublime.get_clipboard())
 
 
 class TerminusPasteCommand(sublime_plugin.TextCommand):
