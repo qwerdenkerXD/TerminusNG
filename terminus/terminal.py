@@ -51,6 +51,53 @@ MAX_INLINE_WRITE = 512
 WRITE_CHUNK_SIZE = 4096
 
 
+class MarkIndex(dict):
+    """
+    view row -> tuple of SemanticMark, carrying a version which every change bumps.
+
+    render.py paints a gutter marker on the prompt row of each command, and which rows
+    those are can only be worked out by walking the marks in order. A long scrollback
+    holds thousands of them and the render runs at 30 Hz, so the walk has to happen
+    when the marks actually moved and not on every frame. Versioning the container
+    rather than bumping a counter at each call site means a later mutation cannot
+    silently forget to.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.version = 0
+
+    def __setitem__(self, row, marks):
+        super().__setitem__(row, marks)
+        self.version += 1
+
+    def pop(self, row, *args):
+        before = len(self)
+        value = super().pop(row, *args)
+        if len(self) != before:
+            self.version += 1
+        return value
+
+    def clear(self):
+        if self:
+            self.version += 1
+        super().clear()
+
+    def shift(self, m):
+        """
+        the top m rows are about to be erased: drop the marks of those rows outright and
+        move the rest up with the text. a clamped mark would be a phantom prompt sitting
+        on row 0 forever.
+
+        this replaces the contents rather than the object, so that the version keeps
+        rising: a fresh MarkIndex would start at zero and read as "nothing changed"
+        """
+        shifted = [(row - m, marks) for (row, marks) in self.items() if row >= m]
+        super().clear()
+        super().update(shifted)
+        self.version += 1
+
+
 class Terminal:
     _terminals = {}
     _detached_terminals = []
@@ -66,7 +113,7 @@ class Terminal:
         # the OSC 133 boundaries the shell reported, view row -> tuple of SemanticMark.
         # they live here and not in view regions because a maximize or a minimize
         # hands the terminal a brand new view with the very same rows
-        self.marks = {}
+        self.marks = MarkIndex()
         # whether the child process runs under TERM=linux, see the unix_term setting
         self.linux_mode = False
         self._strings = Queue()
@@ -334,7 +381,8 @@ class Terminal:
             # a reset or a reused view, so every row a mark names belongs to text
             # which is gone. a maximize or a minimize passes an explicit offset and
             # keeps its marks, the rows are preserved there
-            self.marks = {}
+            # keep the object so the version keeps rising, see MarkIndex.shift
+            self.marks.clear()
             if self.view and self.view.size() > 0:
                 view = self.view
                 self.offset = view.rowcol(view.size())[0] + 1

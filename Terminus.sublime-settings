@@ -106,6 +106,13 @@
     // text and only the plain urls in the text stay clickable, as they always were.
     "hyperlinks": true,
 
+    // put a marker in the gutter on the row every prompt begins on, red when the
+    // command run from that prompt exited non zero. this needs the shell to report
+    // its prompt boundaries with OSC 133, see "shell integration" in the readme;
+    // without that nothing is ever marked. only the gutter is touched, the terminal
+    // output itself keeps the colors the program chose.
+    "prompt_markers": true,
+
     // force the terminal size
     "size": [null, null],
 

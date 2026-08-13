@@ -10,7 +10,8 @@ from wcwidth import wcswidth
 
 
 from .const import CONTINUATION
-from .ptty import XTERM_256_COLORS, EMPTY_LINKS, line_marks, line_links
+from .ptty import (
+    XTERM_256_COLORS, EMPTY_LINKS, MARK_END, MARK_PROMPT, line_marks, line_links)
 from .terminal import Terminal
 from .utils import rev_wcwidth, get_highlight_key
 
@@ -182,6 +183,20 @@ class RowLink:
         return "RowLink({}, {}, {})".format(self.start, self.end, self.link)
 
 
+# the gutter markers of the OSC 133 prompts. two fixed keys rewritten whenever the
+# marks moved, so a scrollback full of prompts costs two `add_regions` calls and not
+# one per prompt. `region.*` scopes are the ones every color scheme defines, so the
+# markers follow the user's theme instead of naming a color of their own
+MARKER_PROMPT_KEY = "terminus_prompt"
+MARKER_FAILED_KEY = "terminus_prompt_failed"
+MARKER_PROMPT_SCOPE = "region.bluish"
+MARKER_FAILED_SCOPE = "region.redish"
+MARKER_ICON = "dot"
+# the gutter only. the row itself is terminal output and restyling it would fight the
+# colors the program chose
+MARKER_FLAGS = sublime.HIDDEN
+
+
 class LinkIndex:
     """
     the OSC 8 hyperlinks of the rows of one view: row -> (region key, tuple of
@@ -321,6 +336,10 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
         # with this off no row is ever put in the index, so nothing is underlined and
         # mouse.py finds no link to open either, which is the whole of the opt out
         self.hyperlinks = settings.get("hyperlinks", True)
+        # with this off the markers are erased once and never painted again
+        self.prompt_markers = settings.get("prompt_markers", True)
+        # the marks version the gutter currently shows, see `paint_markers`
+        self._painted_marks_version = None
 
     def run(self, edit):
         view = self.view
@@ -368,6 +387,9 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
             self.trim_trailing_spaces(edit, terminal)
             self.trim_history(edit, terminal)
             view.run_command("terminus_show_cursor")
+
+        # after the trimming above, which is what moves the rows the markers sit on
+        self.paint_markers(terminal)
 
         current_title = view.name()
         if terminal.title:
@@ -429,6 +451,64 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
             # whatever line occupies the row now carries no mark, so the row does
             # not either, an entry left behind would name text which is gone
             terminal.marks.pop(line, None)
+
+    def paint_markers(self, terminal):
+        """
+        a gutter marker on the row every prompt begins on, red when the command run
+        from that prompt exited non zero.
+
+        the exit status belongs to the mark which CLOSED a command, and the shell
+        reports that at the start of the next prompt cycle, so it lands on the row the
+        next prompt is drawn on. it is carried back to the prompt the command was
+        actually run from: marking the row it arrived on would blame the next prompt
+        for the previous command's failure.
+
+        this walks every mark, so it runs only when they moved. `terminal.marks` is a
+        MarkIndex and carries a version for exactly that
+        """
+        marks = terminal.marks
+        if marks.version == self._painted_marks_version:
+            return
+        self._painted_marks_version = marks.version
+
+        view = self.view
+        view.erase_regions(MARKER_PROMPT_KEY)
+        view.erase_regions(MARKER_FAILED_KEY)
+        if not self.prompt_markers:
+            return
+
+        prompt_rows = []
+        failed_rows = []
+        # the row of the prompt whose command has not been closed yet
+        pending = None
+        for row in sorted(marks):
+            for mark in marks[row]:
+                if mark.kind == MARK_END:
+                    if pending is not None:
+                        # an exit code of 0 and one which was never reported both mean
+                        # there is nothing to flag
+                        (failed_rows if mark.exit_code else prompt_rows).append(pending)
+                        pending = None
+                elif mark.kind == MARK_PROMPT:
+                    if pending is not None:
+                        # a prompt redrawn without its command ever being closed, e.g.
+                        # after a ctrl+c, so nothing is known about how it ended
+                        prompt_rows.append(pending)
+                    pending = row
+        if pending is not None:
+            # the live prompt at the bottom, and any command still running
+            prompt_rows.append(pending)
+
+        for key, rows, scope in (
+                (MARKER_PROMPT_KEY, prompt_rows, MARKER_PROMPT_SCOPE),
+                (MARKER_FAILED_KEY, failed_rows, MARKER_FAILED_SCOPE)):
+            if rows:
+                view.add_regions(
+                    key,
+                    [sublime.Region(view.text_point(row, 0)) for row in rows],
+                    scope,
+                    MARKER_ICON,
+                    MARKER_FLAGS)
 
     def relink_line(self, line, buffer_line):
         """
@@ -575,7 +655,7 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
             # the marks of the rows which are about to go are dropped outright, a
             # clamped one would be a phantom prompt sitting on row 0 forever. the
             # rest shifts with the text, the same way colored_lines does above
-            terminal.marks = {k - m: v for (k, v) in terminal.marks.items() if k >= m}
+            terminal.marks.shift(m)
             # and the link rows, which own view regions, so they are erased and not
             # only forgotten, see LinkIndex.shift
             self.links.shift(view, m)
