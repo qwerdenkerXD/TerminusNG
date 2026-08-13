@@ -21,7 +21,105 @@ KEYS = [
     "ctrl+p"
 ]
 
+SUPPORTED_TERMS = [
+    "linux",
+    "xterm",
+    "xterm-16color",
+    "xterm-256color"
+]
+
 logger = logging.getLogger('Terminus')
+
+
+def executable_name(arg):
+    # the basename without extension, taken by hand because a windows path is not split
+    # by posixpath when the plugin host runs elsewhere
+    arg = arg.strip('"').replace("\\", "/").rstrip("/")
+    arg = arg.rsplit("/", 1)[-1].lower()
+    if arg.endswith(".exe"):
+        arg = arg[:-4]
+    return arg
+
+
+def is_wsl_command(cmd):
+    """
+    whether the command launches a wsl distribution, it may be spelled "wsl", "wsl.exe"
+    or an absolute path and cmd may be a string or a list
+    """
+    if not cmd:
+        return False
+
+    if isinstance(cmd, str):
+        args = shlex_split(cmd)
+    else:
+        args = list(cmd)
+
+    args = [arg for arg in args if isinstance(arg, str) and arg]
+    if not args:
+        return False
+
+    # a shell_cmd is wrapped into "cmd.exe /c ...", the launcher is behind the wrapper
+    if executable_name(args[0]) in ["cmd", "command"] and \
+            len(args) > 2 and args[1].startswith("/"):
+        args = args[2:]
+
+    return executable_name(args[0]) == "wsl"
+
+
+def share_env_with_wsl(env):
+    """
+    wsl.exe hands nothing of the windows environment to the distribution unless the
+    variable is named in WSLENV, so the variables Terminus promises have to be shared
+    explicitly, otherwise TERM_PROGRAM is invisible inside wsl
+    """
+    if "TERM" not in env:
+        env["TERM"] = "xterm-256color"
+    env["COLORTERM"] = "truecolor"
+    env["TERM_PROGRAM"] = "Terminus-Sublime"
+    # read by wsl.exe itself on the windows side, it does not travel through WSLENV
+    env["WSL_UTF8"] = "1"
+
+    # keep whatever the user shares already, WSLENV is a colon separated list of
+    # NAME/flags entries
+    wslenv = env.get("WSLENV", os.environ.get("WSLENV", ""))
+    entries = [entry for entry in wslenv.split(":") if entry]
+    shared = [entry.split("/")[0] for entry in entries]
+    for name in ["TERM", "COLORTERM", "TERM_PROGRAM"]:
+        if name not in shared:
+            # /u shares the value from win32 to wsl only, /p would treat it as a path
+            # and translate, that is, corrupt it
+            entries.append("{}/u".format(name))
+
+    env["WSLENV"] = ":".join(entries)
+
+
+def abandon_detached_terminal(terminal):
+    """
+    a terminal detached for a reset, a maximize or a minimize is hosted by no view, and
+    should_be_reaped deliberately never fires for a detached terminal, so a round trip
+    which cannot finish has to terminate it by hand. otherwise the process stays alive
+    and its renderer thread keeps ticking at 30 Hz for the rest of the session
+    """
+    logger.error("no window to reattach the terminal to, terminating it")
+    terminal.kill()
+    if terminal in Terminal._detached_terminals:
+        Terminal._detached_terminals.remove(terminal)
+
+
+def unoccupied_panel_name(window, panel_name, terminal):
+    """
+    a panel already hosting another live terminal must not be taken over, that terminal
+    would become unreachable by view id while its renderer keeps writing to the view
+    """
+    view = window.find_output_panel(panel_name)
+    if not view:
+        return panel_name
+
+    other = Terminal.from_id(view.id())
+    if not other or other is terminal:
+        return panel_name
+
+    return available_panel_name(window, panel_name)
 
 
 class TerminusOpenCommand(sublime_plugin.WindowCommand):
@@ -115,27 +213,27 @@ class TerminusOpenCommand(sublime_plugin.WindowCommand):
 
         cmd_to_run = sublime.expand_variables(cmd_to_run, st_vars)
 
-        if env:
-            config["env"] = env
-
-        if "env" in config:
-            _env = config["env"]
+        # a copy of the config env, the passed env is merged on top of it instead of
+        # replacing it and neither the config's nor the caller's dict is written to
+        if config and "env" in config:
+            _env = dict(config["env"])
         else:
             _env = {}
 
         _env["TERMINUS_SUBLIME"] = "1"  # for backward compatibility
         _env["TERM_PROGRAM"] = "Terminus-Sublime"
 
+        _env.update(env)
+
+        settings = sublime.load_settings("Terminus.sublime-settings")
+
         if sys.platform.startswith("win"):
-            pass
+            if is_wsl_command(cmd_to_run):
+                share_env_with_wsl(_env)
 
         else:
-            settings = sublime.load_settings("Terminus.sublime-settings")
             if "TERM" not in _env:
                 _env["TERM"] = settings.get("unix_term", "linux")
-
-            if _env["TERM"] not in ["linux", "xterm", "xterm-16color", "xterm-256color"]:
-                raise Exception("{} is not supported.".format(_env["TERM"]))
 
             if "LANG" not in _env:
                 if "LANG" in os.environ:
@@ -143,7 +241,9 @@ class TerminusOpenCommand(sublime_plugin.WindowCommand):
                 else:
                     _env["LANG"] = settings.get("unix_lang", "en_US.UTF-8")
 
-        _env.update(env)
+        # an explicitly provided TERM is validated on every platform, not only on unix
+        if "TERM" in _env and _env["TERM"] not in SUPPORTED_TERMS:
+            raise Exception("{} is not supported.".format(_env["TERM"]))
 
         #  force prompt-toolkit to use 256 color
         if "PROMPT_TOOLKIT_COLOR_DEPTH" not in os.environ \
@@ -202,7 +302,16 @@ class TerminusOpenCommand(sublime_plugin.WindowCommand):
             view = terminal.view
             # avoid terminus_cleanup
             view.settings().set("terminus_view.finished", True)
+            # the renderer of the old terminal queues a deferred terminus_cleanup on its
+            # view, it may still land after terminus_initialize_view has erased the
+            # finished flag for the terminal taking the view over, and would then kill
+            # that fresh process. detaching empties terminal.view first, which makes the
+            # pending callback a no-op no matter when it lands.
+            terminal.detach_view()
             terminal.kill()
+            if terminal in Terminal._detached_terminals:
+                # it was only detached to disarm its cleanup, it is not coming back
+                Terminal._detached_terminals.remove(terminal)
 
         if not view:
             if not panel_name:
@@ -274,9 +383,7 @@ class TerminusOpenCommand(sublime_plugin.WindowCommand):
             ok_configs = [default_config] + ok_configs
 
         self.window.show_quick_panel(
-            [[config["name"],
-              config["cmd"] if isinstance(config["cmd"], str) else config["cmd"][0]]
-             for config in ok_configs],
+            [[config["name"], self.config_details(config)] for config in ok_configs],
             lambda x: on_selection_shell(x)
         )
 
@@ -297,6 +404,14 @@ class TerminusOpenCommand(sublime_plugin.WindowCommand):
                 self.run(config_name=config_name)
             elif index == 1:
                 self.run(config_name=config_name, panel_name=DEFAULT_PANEL)
+
+    def config_details(self, config):
+        # a config carries either cmd or shell_cmd and cmd may be a string, a list or,
+        # in a malformed config, empty
+        cmd = config.get("cmd") or config.get("shell_cmd") or ""
+        if isinstance(cmd, str):
+            return cmd
+        return cmd[0] if cmd else ""
 
     def get_config_by_name(self, name):
         default_config = self.default_config()
@@ -598,6 +713,11 @@ class TerminusResetCommand(sublime_plugin.TextCommand):
                 if terminal.show_in_panel:
                     panel_name = terminal.panel_name
                     window = get_panel_window(view)
+                    if not window:
+                        # the window went away over the detach hop, the terminal is
+                        # detached and nothing would ever attach it again
+                        abandon_detached_terminal(terminal)
+                        return
                     window.destroy_output_panel(panel_name)  # do not reuse
                     new_view = window.get_output_panel(panel_name)
 
@@ -608,6 +728,9 @@ class TerminusResetCommand(sublime_plugin.TextCommand):
                         window.focus_view(new_view)
                 else:
                     window = view.window()
+                    if not window:
+                        abandon_detached_terminal(terminal)
+                        return
                     has_focus = view == window.active_view()
                     layout = window.get_layout()
                     if not has_focus:
@@ -676,6 +799,10 @@ class TerminusMaximizeCommand(sublime_plugin.TextCommand):
         view = self.view
         terminal = Terminal.from_id(view.id())
 
+        # the original args have to survive the transition, otherwise the build settings,
+        # the tag and the reactivability of the terminal are lost
+        args = view.settings().get("terminus_view.args", {})
+
         def run_detach():
             all_text = view.substr(sublime.Region(0, view.size()))
             terminal.detach_view()
@@ -683,11 +810,19 @@ class TerminusMaximizeCommand(sublime_plugin.TextCommand):
             def run_sync():
                 offset = terminal.offset
                 window = get_panel_window(view)
+                if not window:
+                    # the panel or its window went away over the detach hop, the
+                    # terminal is detached and nothing would ever attach it again
+                    abandon_detached_terminal(terminal)
+                    return
                 window.destroy_output_panel(terminal.panel_name)
                 new_view = window.new_file(syntax="Terminus View.sublime-syntax")
 
                 def run_attach():
-                    new_view.run_command("terminus_initialize_view")
+                    view_args = dict(args)
+                    view_args["show_in_panel"] = False
+                    view_args["panel_name"] = None
+                    new_view.run_command("terminus_initialize_view", view_args)
                     new_view.run_command(
                         "terminus_insert", {"point": 0, "character": all_text})
                     terminal.show_in_panel = False
@@ -705,11 +840,14 @@ def dont_close_windows_when_empty(func):
         s = sublime.load_settings('Preferences.sublime-settings')
         close_windows_when_empty = s.get('close_windows_when_empty')
         s.set('close_windows_when_empty', False)
-        func(*args, **kwargs)
-        if close_windows_when_empty:
-            sublime.set_timeout(
-                lambda: s.set('close_windows_when_empty', close_windows_when_empty),
-                1000)
+        try:
+            func(*args, **kwargs)
+        finally:
+            # an exception must not leave the preference disabled for the whole session
+            if close_windows_when_empty:
+                sublime.set_timeout(
+                    lambda: s.set('close_windows_when_empty', close_windows_when_empty),
+                    1000)
     return f
 
 
@@ -727,6 +865,10 @@ class TerminusMinimizeCommand(sublime_plugin.TextCommand):
         view = self.view
         terminal = Terminal.from_id(view.id())
 
+        # the original args have to survive the transition, otherwise the build settings,
+        # the tag and the reactivability of the terminal are lost
+        args = view.settings().get("terminus_view.args", {})
+
         def run_detach():
             all_text = view.substr(sublime.Region(0, view.size()))
             terminal.detach_view()
@@ -735,6 +877,11 @@ class TerminusMinimizeCommand(sublime_plugin.TextCommand):
             def run_sync():
                 offset = terminal.offset
                 window = view.window()
+                if not window:
+                    # the window went away over the detach hop, the terminal is
+                    # detached and nothing would ever attach it again
+                    abandon_detached_terminal(terminal)
+                    return
                 view.close()
                 if "panel_name" in kwargs:
                     panel_name = kwargs["panel_name"]
@@ -743,12 +890,19 @@ class TerminusMinimizeCommand(sublime_plugin.TextCommand):
                     if not panel_name:
                         panel_name = available_panel_name(window, DEFAULT_PANEL)
 
+                # a tab terminal keeps carrying the default panel name, minimizing it
+                # must not evict the terminal which already lives in that panel
+                panel_name = unoccupied_panel_name(window, panel_name, terminal)
+
                 new_view = window.get_output_panel(panel_name)
 
                 def run_attach():
                     terminal.show_in_panel = True
                     terminal.panel_name = panel_name
-                    new_view.run_command("terminus_initialize_view", {"panel_name": panel_name})
+                    view_args = dict(args)
+                    view_args["show_in_panel"] = True
+                    view_args["panel_name"] = panel_name
+                    new_view.run_command("terminus_initialize_view", view_args)
                     new_view.run_command(
                         "terminus_insert", {"point": 0, "character": all_text})
                     window.run_command("show_panel", {"panel": "output.{}".format(panel_name)})

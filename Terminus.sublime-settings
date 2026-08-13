@@ -65,10 +65,15 @@
     "brighten_bold_text": true,
 
     // the default TERM variable of unix system. Possible values are
-    // "linux", "xterm" and "xterm-256color".
+    // "linux", "xterm", "xterm-16color" and "xterm-256color".
     // However, please aware that not all xterm features are supported.
     // setting this to "linux" also switches the home and end keys to the linux
     // console codes instead of the xterm ones.
+    // a TERM passed in the "env" of a shell config or of `terminus_open` wins over
+    // this setting, and is checked against the same list of values on every platform,
+    // Windows included. an unsupported value makes the terminal refuse to open.
+    // on Windows a "wsl.exe" command is given TERM=xterm-256color and has TERM,
+    // COLORTERM and TERM_PROGRAM shared into the distribution through WSLENV.
     "unix_term": "xterm-256color",
 
     // the default LANG variable of unix system.
