@@ -107,11 +107,18 @@
     "hyperlinks": true,
 
     // put a marker in the gutter on the row every prompt begins on, red when the
-    // command run from that prompt exited non zero. this needs the shell to report
-    // its prompt boundaries with OSC 133, see "shell integration" in the readme;
-    // without that nothing is ever marked. only the gutter is touched, the terminal
-    // output itself keeps the colors the program chose.
-    "prompt_markers": true,
+    // command run from that prompt exited non zero, and show the gutter to draw it
+    // in. this needs the shell to report its prompt boundaries with OSC 133, see
+    // "shell integration" in the readme.
+    // off by default: a prompt which reports OSC 133 usually shows the exit status
+    // itself, starship and powerlevel10k both colour the prompt on a failure, and a
+    // second indicator for the same thing in a strip of gutter is not worth the
+    // width. turn it on for a plain prompt which says nothing about how the last
+    // command ended.
+    // this only changes what is drawn. the marks themselves are always recorded, and
+    // they are what "Terminus: Jump to Previous Prompt", "Terminus: Select Command
+    // Output" and "Terminus: Copy Command Output" work from.
+    "prompt_markers": false,
 
     // force the terminal size
     "size": [null, null],

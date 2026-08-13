@@ -336,8 +336,9 @@ class TerminusRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin):
         # with this off no row is ever put in the index, so nothing is underlined and
         # mouse.py finds no link to open either, which is the whole of the opt out
         self.hyperlinks = settings.get("hyperlinks", True)
-        # with this off the markers are erased once and never painted again
-        self.prompt_markers = settings.get("prompt_markers", True)
+        # off by default, see the setting. with it off the markers are erased once
+        # and never painted again
+        self.prompt_markers = settings.get("prompt_markers", False)
         # the marks version the gutter currently shows, see `paint_markers`
         self._painted_marks_version = None
 
