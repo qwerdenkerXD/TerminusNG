@@ -7,9 +7,9 @@ path. This module is that translation and nothing else. It imports no sublime,
 spawns nothing, and holds no state beyond one cached lookup of the default
 distribution name.
 
-    /mnt/c/Users/franz/x   <->  C:\Users\franz\x
-    /home/franz/project    <->  \\wsl.localhost\Ubuntu\home\franz\project
-                                \\wsl$\Ubuntu\home\franz\project   (older builds)
+    /mnt/c/Users/you/x     <->  C:\Users\you\x
+    /home/you/project      <->  \\wsl.localhost\Ubuntu\home\you\project
+                                \\wsl$\Ubuntu\home\you\project     (older builds)
 
 A path here is untrusted input, it is whatever the shell printed, so every entry
 point validates before it translates and returns None rather than a guess. Nothing
