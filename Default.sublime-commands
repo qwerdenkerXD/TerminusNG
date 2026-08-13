@@ -68,6 +68,10 @@
         "args": {"remove": true}
     },
     {
+        "caption": "Terminus Utilities: Backend Info",
+        "command": "terminus_backend_info"
+    },
+    {
         "caption": "Preferences: Terminus Settings",
         "command": "edit_settings",
         "args":
