@@ -5,15 +5,18 @@ with **OSC 7**, and once it does, a new terminal opened from that one starts in 
 same place instead of in the first project folder. A shell reports where its prompts,
 its input and its command output begin and end with **OSC 133**, and once it does,
 Terminus can tell the three apart instead of seeing one undifferentiated stream of
-characters.
+characters. A program marks a run of text as a link with **OSC 8**, and once it does,
+that run is underlined and clickable instead of being a string the terminal has to
+guess at.
 
 Nothing here is required — without it the terminal behaves exactly as before.
 Set `"follow_shell_cwd": false` in the Terminus settings to ignore the OSC 7 reports.
 OSC 133 has no setting of its own: the marks are only ever recorded, never drawn, and
 a shell which does not report them simply leaves the commands below with nothing to
-go on.
+go on. OSC 8 needs nothing from your rc file at all — it comes from the programs you
+run, not from the shell.
 
-The two are independent. Emitting OSC 7 does not require OSC 133 and the other way
+The three are independent. Emitting OSC 7 does not require OSC 133 and the other way
 round, and the snippets below are written so both sets can live in the same rc file.
 
 ## What OSC 7 looks like
@@ -281,6 +284,102 @@ a `test`, a `set -q`, a `printf` — leaves its own status behind in `$status`.
 fish strips escape sequences when it measures prompt width, so no zero-width markers
 are needed — this is the one shell where the marks can simply be printed.
 
+## Hyperlinks (OSC 8)
+
+OSC 7 answers *where am I* and OSC 133 answers *what is this text*. OSC 8 answers
+*where does this text point* — it attaches a uri to a run of characters, so a file
+name in `ls` output or a pull request number in a log line can be clicked instead of
+copied, pasted and guessed at.
+
+    ESC ] 8 ; PARAMS ; URI ST   everything printed from here on is inside the link
+    ESC ] 8 ; ; ST              the link ends here
+
+`ST` is `ESC \`; `BEL` (`\007`) is accepted as the terminator here too. `PARAMS` is a
+`:`-separated list of `key=value` pairs and is almost always empty — the one key in
+use is `id=`, which names the link:
+
+    ESC ] 8 ; id=src ; file:///home/you/project/main.py ST
+
+`id=` is what a program uses to say that two runs printed separately are one link —
+a file name split over two columns, say. Terminus records it, and it is there for
+anything that asks a link for its identity, but it changes nothing about the display:
+every run is underlined on its own, including the two halves of a link that wrapped at
+the right margin. Since both halves open the same target anyway, there is nothing to
+notice. An `id=` longer than 64 characters is dropped, the link itself is kept.
+
+Text inside a link is drawn underlined. Hovering it shows where it goes; clicking the
+link icon in that popup opens it — a `file://` uri in Sublime, an `http`/`https` uri
+in the browser. A plain click is left alone, it still selects text, and right-clicking
+a link offers the same thing as **Open &lt;target&gt;** in the context menu. The
+underline is the only thing that changes about the text: colours, bold and everything
+else the program printed are left alone, and a terminal that does not understand
+OSC 8 simply prints the text and drops the sequence, so output stays readable
+everywhere.
+
+The popup deliberately shows the *host* on its own, in front of the rest of the uri,
+and says so plainly when a target carries a `user@` in front of its host or a
+character that would reorder or hide part of what you are reading. A link's text can
+claim anything; its host is the only part that decides who is on the other end.
+
+Set `"hyperlinks": false` in the Terminus settings to turn all of this off. The
+sequences are then still consumed — they never appear as garbage in the output — but
+nothing is underlined and nothing is clickable except the plain urls in the text,
+which have always been.
+
+### Which schemes are honoured
+
+Only `http`, `https` and `file`. A uri longer than 2048 characters, or containing a
+control character or a raw space, is refused outright, as is any spelling whose
+scheme would change once it is percent-decoded.
+
+The reason is worth stating plainly: everything a terminal shows is text some program
+chose to print, and Terminus has no way to know whether that program is your `ls` or
+the contents of a file you just `cat`'d, a log line quoting an attacker's input, or a
+compromised script. A link is different from other text because the user is *invited*
+to click it — the underline is a promise that clicking is a reasonable thing to do.
+So the set of things a click can do is kept to opening a document or a web page.
+Schemes that hand a string to a program instead of naming a document — `javascript:`,
+`vscode:`, `mailto:`, `smb:`, anything registered on the machine as a protocol
+handler — are dropped, and the text is shown as ordinary output. Nothing is silently
+rewritten: a refused link is simply not a link.
+
+### Getting them
+
+GNU coreutils 8.29 and later can link the names it prints:
+
+```bash
+ls --hyperlink=auto
+```
+
+`auto` emits the sequences only when writing to a terminal, so it is safe in an alias
+and does no damage in a pipe. Several of the newer command line tools do the same —
+`eza --hyperlink`, `rg --hyperlink-format=file`. git itself emits none: there is no
+hyperlink option anywhere in git 2.55, so what links a git command's output is
+whatever pager or diff filter you have in front of it, not git.
+
+For your own scripts, one printf does it:
+
+```bash
+__terminus_link() {
+    # __terminus_link URI TEXT
+    printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$1" "$2"
+}
+
+__terminus_link "file://$PWD/build.log" "build.log"
+printf '\n'
+```
+
+`\033\\` is `ESC \`, the terminator; the second, empty sequence closes the link so the
+rest of the line is plain text again. Print an absolute path in the `file://` uri —
+a relative one has nothing to be relative *to* by the time it is clicked. Percent-encode
+anything exotic in it: a raw space ends the uri as far as the parser is concerned.
+
+Two habits keep this from going wrong. Close every link you open — an unterminated
+link is abandoned after 8192 characters rather than swallowing the rest of the
+session, but the text in between is underlined and clickable until then. And guard the
+sequences on the output being a terminal (`[ -t 1 ]`) if the script's output is ever
+redirected to a file.
+
 ## A note on WSL
 
 `wsl.exe` passes nothing of the Windows environment into the distribution unless the
@@ -289,6 +388,41 @@ variable is named in `WSLENV`. Terminus does that for you: a `wsl.exe` command g
 `$TERM_PROGRAM` guards above work inside WSL.
 
 The path a WSL shell reports is a path *inside* the distribution — `/home/you/project`,
-not `C:\Users\you\project`. Sublime, running on the Windows side, cannot open it, so
-Terminus ignores it rather than guessing. Translating between the two is a separate
-job and is not done yet.
+not `C:\Users\you\project`. Sublime runs on the Windows side and cannot open the first
+form, so those paths are now translated to their Windows spelling before anything is
+done with them. This applies to both directions of the same problem: the working
+directory from OSC 7, which is what a new terminal opens in, and the target of a
+`file://` hyperlink, which is what a click opens.
+
+Two shapes come out of it. A path under `/mnt` is a Windows drive seen from inside the
+distribution and translates on its own — `/mnt/c/Users/you/project` is
+`C:\Users\you\project`. Anything else lives in the distribution's own filesystem and
+needs the distribution's *name* to be reachable at all, as
+`\\wsl.localhost\Ubuntu\home\you\project`.
+
+The name is taken from the command that started the terminal — `wsl.exe -d Ubuntu`,
+`--distribution=Ubuntu` and the same thing behind a `cmd.exe /c` wrapper are all
+recognised — and otherwise from the default distribution recorded by WSL itself.
+
+When neither is available, nothing is guessed. A `/home/...` path with no known
+distribution stays untranslated and is then simply unusable from the Windows side:
+the reported directory is ignored exactly as before, and a `file://` link to it does
+not open. That is deliberate — the same path exists in every installed distribution,
+and picking one would open the wrong file rather than none.
+
+"No known distribution" includes the cases where the command *does* pick one but not
+by a name Terminus can read: `wsl.exe --distribution-id <guid>`, `wsl.exe --system`,
+or any option it has not seen before. Those fall back to nothing rather than to the
+default distribution, for the same reason.
+
+A handful of names have no Windows spelling at all and are refused as well: a path
+component ending in a dot or a space, or containing `:`, `*`, `?`, `"`, `<`, `>`, `|`
+or a backslash. All of those are ordinary characters in a Linux file name, but Windows
+strips a trailing dot and space before it opens anything, so a link to `report.` in a
+directory that also holds `report` would quietly hand you `report`.
+
+Once a directory is reachable, **Terminus: Open Shell Directory as Folder** in the
+command palette adds it to the window as a project folder — the shell's own directory,
+`\\wsl.localhost\...` spelling and all. It uses exactly the same reachability check,
+so it is available whenever `"follow_shell_cwd"` is on and the shell has reported a
+directory that this side can list.
